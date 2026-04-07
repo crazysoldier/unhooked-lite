@@ -66,7 +66,7 @@ for x in _raw_ids.split(","):
         try:
             ALLOWED_IDS.add(int(x.strip()))
         except ValueError:
-            log.error(f"Invalid ID in ALLOWED_TELEGRAM_CHAT_IDS: {x}")
+            log.error("Invalid ID in ALLOWED_TELEGRAM_CHAT_IDS: %s", x)
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -119,7 +119,7 @@ S_HABIT, S_HABIT_TXT, S_LAST, S_WAKE, S_SAVINGS, S_TRIG, S_WHY = range(7)
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not update.message:
         return ConversationHandler.END
-    kb = [[InlineKeyboardButton(label, callback_data=f"h:{name or 'other'}")] for label, name in HABITS]
+    kb = [[InlineKeyboardButton(label, callback_data=f"h:{name or 'other'}\")] for label, name in HABITS]
     await update.message.reply_text("Hey. Ich bin dein Unhooked Coach. Bereit, die Kontrolle zurückzuholen?")
     await update.message.reply_text("Was möchtest du verändern?", reply_markup=InlineKeyboardMarkup(kb))
     return S_HABIT
@@ -439,7 +439,6 @@ async def sos_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await q.answer()
     action = q.data.split(":")[1]
     msg = q.message
-    uid = update.effective_user.id if update.effective_user else 0
 
     if action == "ground":
         await msg.reply_text("🧘 Grounding (5-4-3-2-1)\n\nNenne mir 5 Dinge, die du gerade SIEHST:")
