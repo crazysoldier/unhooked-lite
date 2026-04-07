@@ -535,7 +535,10 @@ async def surf_r1(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not q or not q.data or not isinstance(q.message, Message):
         return ConversationHandler.END
     await q.answer()
-    r = int(q.data.split("_")[1])
+    try:
+        r = int(q.data.split("_")[1])
+    except (IndexError, ValueError):
+        return ConversationHandler.END
     ud = ctx.user_data or {}
     ud["surf_r1"] = r
     m = await q.message.reply_text(f"Intensität: {r}/10\n\n🌊 Beobachte die Welle... ⏳ 2 Min")
@@ -553,7 +556,10 @@ async def surf_r2(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not q or not q.data or not isinstance(q.message, Message):
         return ConversationHandler.END
     await q.answer()
-    r2 = int(q.data.split("_")[1])
+    try:
+        r2 = int(q.data.split("_")[1])
+    except (IndexError, ValueError):
+        return ConversationHandler.END
     r1 = (ctx.user_data or {}).get("surf_r1", r2)
     diff = r1 - r2
     if diff > 0:
