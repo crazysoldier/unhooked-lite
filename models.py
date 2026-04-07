@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -41,7 +44,13 @@ class UserState:
 
     def calc_streak(self, today: date | None = None) -> int:
         base = today or date.today()
-        delta = (base - date.fromisoformat(self.quit_date)).days + 1
+        try:
+            quit = date.fromisoformat(self.quit_date)
+        except ValueError:
+            logger.warning("Invalid quit_date '%s' for user %d, resetting to today", self.quit_date, self.user_id)
+            self.quit_date = base.isoformat()
+            quit = base
+        delta = (base - quit).days + 1
         self.streak_days = max(0, delta)
         self.longest_streak = max(self.longest_streak, self.streak_days)
         return self.streak_days
@@ -92,15 +101,23 @@ class Store:
         p = self._path(uid)
         if not p.exists():
             return None
-        return UserState.from_dict(json.loads(p.read_text()))
+        try:
+            return UserState.from_dict(json.loads(p.read_text()))
+        except (json.JSONDecodeError, TypeError) as exc:
+            logger.error("Corrupted data file %s: %s", p, exc)
+            return None
 
     def save(self, user: UserState) -> None:
-        self._path(user.user_id).write_text(
-            json.dumps(user.to_dict(), ensure_ascii=False, indent=2)
-        )
+        path = self._path(user.user_id)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(user.to_dict(), ensure_ascii=False, indent=2))
+        tmp.replace(path)
 
     def all_users(self) -> list[UserState]:
-        return [
-            UserState.from_dict(json.loads(f.read_text()))
-            for f in self.base.glob("*.json")
-        ]
+        users: list[UserState] = []
+        for f in self.base.glob("*.json"):
+            try:
+                users.append(UserState.from_dict(json.loads(f.read_text())))
+            except (json.JSONDecodeError, TypeError) as exc:
+                logger.error("Skipping corrupted data file %s: %s", f, exc)
+        return users
