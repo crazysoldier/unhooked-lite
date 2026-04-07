@@ -18,7 +18,7 @@ class UserState:
     username: str = ""
     habit: str = ""
     why: str = ""
-    quit_date: str = field(default_factory=lambda: date.today().isoformat())
+    quit_date: str = field(default_factory=lambda: datetime.now(ZoneInfo("UTC")).date().isoformat())
     wake_time: str = "07:30"
     timezone: str = "Europe/Vienna"
     triggers: list[str] = field(default_factory=list)
