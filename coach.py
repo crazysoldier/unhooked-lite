@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import NamedTuple
+
+from anthropic import AsyncAnthropic
+from openai import AsyncOpenAI
 
 from models import UserState
 
@@ -40,7 +43,8 @@ class History:
 # System prompt builder (replaces prompts.py, prompt_rules.py, category_prompts.py, coaching_style.py)
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are the Unhooked coach — a direct, warm, no-bullshit addiction recovery coach on Telegram.
+SYSTEM_PROMPT = """\
+You are the Unhooked coach — a direct, warm, no-bullshit addiction recovery coach on Telegram.
 
 User profile:
 - Quitting: {habit}
@@ -48,6 +52,7 @@ User profile:
 - Their WHY: {why}
 - Recent triggers: {triggers}
 - Current mood: {mood}
+- Recent journal: {recent}
 
 Rules:
 1. Match the user's language (German/English) automatically.
@@ -67,6 +72,8 @@ What the best responses look like:
 - Win: "💪" or one sentence. Not a paragraph.
 """
 
+_FALLBACK_REPLY = "Take one concrete action in the next 5 minutes."
+
 
 def build_system_prompt(user: UserState) -> str:
     recent = "; ".join(e.get("text", "") for e in user.journal[-3:]) or "none"
@@ -80,6 +87,7 @@ def build_system_prompt(user: UserState) -> str:
         why=user.why or "not set",
         triggers=", ".join(user.triggers) or "none",
         mood=mood,
+        recent=recent,
     )
 
 
@@ -114,7 +122,6 @@ class AIClient:
             return "Pause. Atme 4-4-8 — dann schreib mir, was als Nächstes kommt."
 
     async def _openai(self, system: str, message: str) -> str:
-        from openai import AsyncOpenAI
         client = AsyncOpenAI(api_key=self.openai_key)
         r = await client.chat.completions.create(
             model=self.model,
@@ -122,10 +129,11 @@ class AIClient:
             temperature=0.5,
             max_tokens=300,
         )
-        return r.choices[0].message.content or "Take one concrete action in the next 5 minutes."
+        if not r.choices:
+            return _FALLBACK_REPLY
+        return r.choices[0].message.content or _FALLBACK_REPLY
 
     async def _anthropic(self, system: str, message: str) -> str:
-        from anthropic import AsyncAnthropic
         client = AsyncAnthropic(api_key=self.anthropic_key)
         r = await client.messages.create(
             model=self.model,
@@ -134,7 +142,7 @@ class AIClient:
             messages=[{"role": "user", "content": message}],
         )
         parts = [b.text for b in r.content if hasattr(b, "text")]
-        return " ".join(parts).strip() or "Take one concrete action in the next 5 minutes."
+        return " ".join(parts).strip() or _FALLBACK_REPLY
 
 
 # ---------------------------------------------------------------------------
