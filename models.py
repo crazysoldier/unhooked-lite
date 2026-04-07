@@ -6,6 +6,7 @@ import json
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 
 @dataclass
@@ -27,7 +28,7 @@ class UserState:
     journal: list[dict] = field(default_factory=list)
     emergency_contact: str = ""
     last_relapse_reset: dict | None = None
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = field(default_factory=lambda: datetime.now(ZoneInfo("UTC")).isoformat())
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -51,7 +52,7 @@ class UserState:
             "streak_days": self.streak_days,
             "longest_streak": self.longest_streak,
             "relapses": self.relapses,
-            "reset_at": datetime.utcnow().isoformat(),
+            "reset_at": datetime.now(ZoneInfo("UTC")).isoformat(),
         }
         self.relapses += 1
         self.quit_date = (reset_date or date.today()).isoformat()
@@ -64,7 +65,7 @@ class UserState:
             reset_at = datetime.fromisoformat(str(self.last_relapse_reset["reset_at"]))
         except (KeyError, ValueError):
             return False
-        if datetime.utcnow() - reset_at > timedelta(seconds=window_s):
+        if datetime.now(ZoneInfo("UTC")) - reset_at > timedelta(seconds=window_s):
             return False
         self.quit_date = str(self.last_relapse_reset["quit_date"])
         self.streak_days = int(self.last_relapse_reset["streak_days"])
