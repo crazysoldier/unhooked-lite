@@ -18,10 +18,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 from datetime import date, datetime, time, timedelta
-from typing import cast
+from typing import Any, cast
 from zoneinfo import ZoneInfo
-from dotenv import load_dotenv
 
 from telegram import (
     BotCommand,
@@ -51,23 +51,21 @@ log = logging.getLogger("unhooked")
 
 # ── Config ────────────────────────────────────────────────────────────────
 
-load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 AI_PROVIDER = os.getenv("AI_PROVIDER", "openai").lower()
 AI_MODEL = os.getenv("AI_MODEL", "gpt-4o")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Vienna")
+try:
+    ZoneInfo(TIMEZONE)
+except Exception:
+    log.error("Invalid TIMEZONE: %s. Falling back to Europe/Vienna.", TIMEZONE)
+    TIMEZONE = "Europe/Vienna"
 DATA_DIR = os.getenv("DATA_DIR", "./data")
 
 _raw_ids = os.getenv("ALLOWED_TELEGRAM_CHAT_IDS", "")
-ALLOWED_IDS: set[int] = set()
-for x in _raw_ids.split(","):
-    if x.strip():
-        try:
-            ALLOWED_IDS.add(int(x.strip()))
-        except ValueError:
-            log.error("Invalid ID in ALLOWED_TELEGRAM_CHAT_IDS: %s", x)
+ALLOWED_IDS: set[int] = {int(x) for x in _raw_ids.split(",") if x.strip()} if _raw_ids.strip() else set()
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -106,337 +104,118 @@ async def _guard(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ONBOARDING  (/start)
 # ══════════════════════════════════════════════════════════════════════════
 
-HABITS = [
-    ("🌿 Cannabis", "Cannabis"), ("🚬 Spliffs", "Spliffs"),
-    ("🎮 Gaming", "Gaming"), ("🔞 Porn", "Porn"),
-    ("🛍️ Kaufsucht", "Kaufsucht"), ("💔 Toxische Beziehung", "Toxic"),
-    ("✏️ Anderes", None),
-]
-LAST_USE = [("today", 0), ("yesterday", 1), ("2-3 days", 2), ("week+", 7)]
-TRIGGERS = ["Langeweile", "Stress", "Angst", "Einsamkeit", "Sozialer Druck", "Abends", "Morgens"]
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /start — onboarding flow."""
+    if not isinstance(update.effective_user, Update):
+        await update.message.reply_text("Whoops, system error.")
+        return
+    uid = update.effective_user.id
+    user = store(ctx).load(uid)
+    if user:
+        await update.message.reply_text(f"👋 Willkommen zurück, {user.name}!")
+        return
+    # New user
+    ctx.user_data = ctx.user_data or {}
+    ctx.user_data["uid"] = uid
+    await update.message.reply_text("👋 Willkommen bei Unhooked Lite.\n\nWie heißt du?")
 
-S_HABIT, S_HABIT_TXT, S_LAST, S_WAKE, S_SAVINGS, S_TRIG, S_WHY = range(7)
-
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-    kb = [[InlineKeyboardButton(label, callback_data=f"h:{name or 'other'}")] for label, name in HABITS]
-    await update.message.reply_text("Hey. Ich bin dein Unhooked Coach. Bereit, die Kontrolle zurückzuholen?")
-    await update.message.reply_text("Was möchtest du verändern?", reply_markup=InlineKeyboardMarkup(kb))
-    return S_HABIT
-
-async def on_habit(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    if not q or not q.data:
-        return ConversationHandler.END
-    await q.answer()
-    val = q.data.split(":", 1)[1]
-    ud = ctx.user_data or {}
-    if val == "other":
-        await q.message.reply_text("Was möchtest du verändern? (Schreib es einfach)")
-        return S_HABIT_TXT
-    ud["habit"] = val
-    kb = [[InlineKeyboardButton(f"{k} ({d}d)", callback_data=f"l:{d}")] for k, d in LAST_USE]
-    await q.message.reply_text("Wann war dein letzter Konsum?", reply_markup=InlineKeyboardMarkup(kb))
-    return S_LAST
-
-async def on_habit_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-    ud = ctx.user_data or {}
-    ud["habit"] = (update.message.text or "Other").strip()[:50]
-    kb = [[InlineKeyboardButton(f"{k} ({d}d)", callback_data=f"l:{d}")] for k, d in LAST_USE]
-    await update.message.reply_text("Wann war dein letzter Konsum?", reply_markup=InlineKeyboardMarkup(kb))
-    return S_LAST
-
-async def on_last_use(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    if not q or not q.data:
-        return ConversationHandler.END
-    await q.answer()
-    ud = ctx.user_data or {}
-    ud["quit_days"] = int(q.data.split(":")[1])
-    await q.message.reply_text("Wann stehst du normalerweise auf? (HH:MM)")
-    return S_WAKE
-
-async def on_wake(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-    ud = ctx.user_data or {}
-    ud["wake"] = (update.message.text or "07:30").strip()
-    await update.message.reply_text("Wie viel gibst du ungefähr pro Tag dafür aus? (z.B. 15)")
-    return S_SAVINGS
-
-async def on_savings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-    ud = ctx.user_data or {}
-    try:
-        ud["savings"] = max(0.0, round(float((update.message.text or "0").replace(",", ".")), 2))
-    except ValueError:
-        await update.message.reply_text("Bitte gib eine Zahl ein, z.B. 15")
-        return S_SAVINGS
-    ud["sel_trigs"] = []
-    await update.message.reply_text("Wann schlagen Cravings am härtesten zu?", reply_markup=_trig_kb(set()))
-    return S_TRIG
-
-def _trig_kb(sel: set[str]) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(("✅ " if t in sel else "") + t, callback_data=f"t:{t}")] for t in TRIGGERS]
-    rows.append([InlineKeyboardButton("✔️ Fertig", callback_data="t:DONE")])
-    return InlineKeyboardMarkup(rows)
-
-async def on_trigger(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    if not q or not q.data:
-        return ConversationHandler.END
-    await q.answer()
-    val = q.data.split(":", 1)[1]
-    ud = ctx.user_data or {}
-    sel: list[str] = ud.setdefault("sel_trigs", [])
-    if val == "DONE":
-        await q.message.reply_text("Was ist dein WARUM? Wofür machst du das?")
-        return S_WHY
-    if val in sel:
-        sel.remove(val)
-    else:
-        sel.append(val)
-    await q.edit_message_reply_markup(reply_markup=_trig_kb(set(sel)))
-    return S_TRIG
-
-async def on_why(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message or not update.effective_user:
-        return ConversationHandler.END
-    ud = ctx.user_data or {}
-    why = (update.message.text or "").strip()
-    quit_days = ud.get("quit_days", 0)
-    quit_date = datetime.now(ZoneInfo(TIMEZONE)).date() - timedelta(days=quit_days)
-    user = UserState(
-        user_id=update.effective_user.id,
-        username=update.effective_user.username or "",
-        habit=ud.get("habit", "Other"),
-        why=why,
-        quit_date=quit_date.isoformat(),
-        wake_time=ud.get("wake", "07:30"),
-        triggers=ud.get("sel_trigs", []),
-        timezone=TIMEZONE,
-        savings_per_day=ud.get("savings", 1.5),
-    )
-    user.calc_streak()
+async def on_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Save user name and create account."""
+    if not update.message or not update.message.text:
+        return
+    name = update.message.text.strip()
+    uid = ctx.user_data.get("uid") if ctx.user_data else 0
+    if not uid:
+        await update.message.reply_text("Fehler. Bitte /start erneut.")
+        return
+    user = UserState(user_id=uid, name=name)
     store(ctx).save(user)
-    _schedule_user_jobs(ctx.application, user)
+    ctx.user_data = {}  # reset
     await update.message.reply_text(
-        f"Alles klar. Tag {user.streak_days} startet jetzt.\n\n"
-        f"Dein WARUM: {why}\n\n"
-        "Ich bin rund um die Uhr für dich da. Schreib mir einfach. 🪝"
-    )
-    ud.clear()
-    return ConversationHandler.END
-
-async def cmd_cancel(update: Update, _) -> int:
-    if update.message:
-        await update.message.reply_text("Abgebrochen. /start wenn du bereit bist.")
-    return ConversationHandler.END
-
-# ══════════════════════════════════════════════════════════════════════════
-# TRACKING  (/status, /reset, /undo, /why, /savings, /check)
-# ══════════════════════════════════════════════════════════════════════════
-
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_user:
-        return
-    user = store(ctx).load(update.effective_user.id)
-    if not user:
-        await update.message.reply_text("Starte zuerst mit /start.")
-        return
-    user.calc_streak()
-    store(ctx).save(user)
-    await update.message.reply_text(
-        f"🔥 Streak: {user.streak_days} Tag(e)\n"
-        f"🏆 Längster: {user.longest_streak} Tag(e)\n"
-        f"💶 Gespart: €{user.savings():.2f}\n"
-        f"🎯 Rückfälle: {user.relapses}"
+        f"Gut, {name}! 👋\n\nUnhooked Lite ist dein Begleiter für:\n"
+        "✅ Streak tracking\n"
+        "✅ Crisis toolkit (/sos)\n"
+        "✅ AI coaching\n"
+        "✅ Journaling\n\n"
+        "Starten wir! /sos für Soforthilfe, oder schreib mir eine Nachricht."
     )
 
-async def cmd_why(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_user:
-        return
-    user = store(ctx).load(update.effective_user.id)
-    if not user or not user.why:
-        await update.message.reply_text("Setz dein WARUM in /start.")
-        return
-    await update.message.reply_text(f"Dein WARUM: {user.why}")
-
-async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_user:
-        return
-    if not ctx.args or ctx.args[0].lower() != "confirm":
-        await update.message.reply_text("Das setzt deinen Streak zurück. /reset confirm wenn du sicher bist.")
-        return
-    user = store(ctx).load(update.effective_user.id)
-    if not user:
-        await update.message.reply_text("Kein Profil. /start zuerst.")
-        return
-    user.reset_streak()
-    store(ctx).save(user)
-    await update.message.reply_text("Reset. Tag 1 startet jetzt. Du bist nicht hinten dran — du bist wieder im Kampf.")
-
-async def cmd_undo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_user:
-        return
-    user = store(ctx).load(update.effective_user.id)
-    if not user:
-        await update.message.reply_text("Kein Profil. /start zuerst.")
-        return
-    if not user.last_relapse_reset:
-        await update.message.reply_text("Kein Reset zum Rückgängigmachen.")
-        return
-    if not user.undo_reset():
-        await update.message.reply_text("Undo-Fenster abgelaufen (5 Min).")
-        return
-    store(ctx).save(user)
-    await update.message.reply_text(f"Undo erledigt. Wiederhergestellt auf Tag {user.streak_days}.")
-
-async def cmd_savings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_user:
-        return
-    user = store(ctx).load(update.effective_user.id)
-    if not user:
-        await update.message.reply_text("Starte zuerst mit /start.")
-        return
-    args = ctx.args or []
-    if args and args[0] == "set" and len(args) >= 2:
-        try:
-            user.savings_per_day = max(0, round(float(args[1]), 2))
-            store(ctx).save(user)
-            await update.message.reply_text(f"Gespeichert: €{user.savings_per_day:.2f}/Tag.")
-        except ValueError:
-            await update.message.reply_text("Bitte: /savings set 15")
-        return
-    if args and args[0] == "goal" and len(args) >= 2:
-        try:
-            user.savings_goal = max(0, round(float(args[1]), 2))
-            store(ctx).save(user)
-            await update.message.reply_text(f"🎯 Sparziel: €{user.savings_goal:.2f}")
-        except ValueError:
-            await update.message.reply_text("Bitte: /savings goal 500")
-        return
-    user.calc_streak()
-    msg = f"💶 Gespart: €{user.savings():.2f} ({user.streak_days} Tage × €{user.savings_per_day:.2f})"
-    if user.savings_goal > 0:
-        pct = min(100, user.savings() / user.savings_goal * 100)
-        msg += f"\n🎯 Ziel: €{user.savings_goal:.2f} ({pct:.0f}%)"
-    await update.message.reply_text(msg)
-
-async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Quick check-in: /check <mood> [craving] [stress] (1-10 each)."""
-    if not update.message or not update.effective_user:
-        return
-    user = store(ctx).load(update.effective_user.id)
-    if not user:
-        await update.message.reply_text("Starte zuerst mit /start.")
-        return
-    args = ctx.args or []
-    if not args:
-        await update.message.reply_text("Nutzung: /check 7 3 2 (Stimmung Craving Stress)")
-        return
-    vals = []
-    for a in args[:3]:
-        try:
-            vals.append(max(1, min(10, int(a))))
-        except ValueError:
-            pass
-    mood = vals[0] if vals else 5
-    craving = vals[1] if len(vals) > 1 else None
-    stress = vals[2] if len(vals) > 2 else None
-    entry = {"date": datetime.now(ZoneInfo("UTC")).isoformat(), "morning": mood, "craving": craving, "stress": stress}
-    user.mood_log.append(entry)
-    store(ctx).save(user)
-    parts = [f"Stimmung: {mood}/10"]
-    if craving is not None:
-        parts.append(f"Craving: {craving}/10")
-    if stress is not None:
-        parts.append(f"Stress: {stress}/10")
-    await update.message.reply_text("✅ " + " | ".join(parts))
-
 # ══════════════════════════════════════════════════════════════════════════
-# JOURNAL  (/journal)
+# STREAK & STATUS
 # ══════════════════════════════════════════════════════════════════════════
 
-J_WRITE = 0
-
-async def cmd_journal(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message or not update.effective_user:
-        return ConversationHandler.END
-    user = store(ctx).load(update.effective_user.id)
+async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current streak, savings, mood."""
+    if not update.effective_user:
+        return
+    uid = update.effective_user.id
+    user = store(ctx).load(uid)
     if not user:
-        await update.message.reply_text("Starte zuerst mit /start.")
-        return ConversationHandler.END
-    args = ctx.args or []
-    if args and args[0] == "list":
-        if not user.journal:
-            await update.message.reply_text("Noch keine Einträge.")
-            return ConversationHandler.END
-        lines = [f"#{i+1} {e['date'][:10]}: {e['text'][:60]}" for i, e in enumerate(user.journal[-10:])]
-        await update.message.reply_text("\n".join(lines))
-        return ConversationHandler.END
-    if args and args[0] == "read" and len(args) >= 2:
-        try:
-            idx = int(args[1]) - 1
-            e = user.journal[idx]
-            await update.message.reply_text(f"#{idx+1} ({e['date'][:10]}):\n{e['text']}")
-        except (IndexError, ValueError):
-            await update.message.reply_text(f"Eintrag nicht gefunden. Du hast {len(user.journal)} Einträge.")
-        return ConversationHandler.END
-    await update.message.reply_text("📓 Schreib einfach drauf los — was beschäftigt dich gerade?\n(/cancel zum Abbrechen)")
-    return J_WRITE
+        await update.message.reply_text("Starten Sie mit /start.")
+        return
+    days = (date.today() - user.start_date).days if user.start_date else 0
+    savings = user.daily_savings * days if user.daily_savings else 0
+    mood_str = f"Mood: {user.last_mood}" if user.last_mood else "Mood: ?"
+    text = f"📊 Status\n\n🔥 Streak: {days} days\n💰 Saved: €{savings:.2f}\n{mood_str}"
+    await update.message.reply_text(text)
 
-async def on_journal_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message or not update.effective_user:
-        return ConversationHandler.END
-    user = store(ctx).load(update.effective_user.id)
+async def reset_streak(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reset streak to 0."""
+    if not update.effective_user:
+        return
+    uid = update.effective_user.id
+    user = store(ctx).load(uid)
     if not user:
-        return ConversationHandler.END
-    text = (update.message.text or "").strip()
-    if not text:
-        await update.message.reply_text("Schreib einfach deinen Gedanken — oder /cancel.")
-        return J_WRITE
-    user.journal.append({"date": datetime.now(ZoneInfo("UTC")).isoformat(), "text": text})
+        await update.message.reply_text("Start with /start.")
+        return
+    # Save old date for undo
+    ctx.user_data = ctx.user_data or {}
+    ctx.user_data["last_start_date"] = user.start_date
+    user.start_date = date.today()
     store(ctx).save(user)
-    await update.message.reply_text("Gespeichert. Starker Move — Bewusstsein schlägt Autopilot. 📝")
-    return ConversationHandler.END
+    await update.message.reply_text("🔄 Streak zurückgesetzt.")
+
+async def undo_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Undo last reset."""
+    if not update.effective_user:
+        return
+    uid = update.effective_user.id
+    user = store(ctx).load(uid)
+    if not user or not (ctx.user_data and ctx.user_data.get("last_start_date")):
+        await update.message.reply_text("Nichts zum rückgängig machen.")
+        return
+    user.start_date = ctx.user_data["last_start_date"]
+    store(ctx).save(user)
+    ctx.user_data["last_start_date"] = None
+    await update.message.reply_text("↩️ Reset rückgängig gemacht.")
 
 # ══════════════════════════════════════════════════════════════════════════
-# CRISIS TOOLKIT  (/sos, /craving)
+# CRISIS TOOLKIT (/sos)
 # ══════════════════════════════════════════════════════════════════════════
 
-C_MENU, C_G1, C_G2, C_G3, C_G4, C_G5, C_SURF1, C_SURF_R1, C_SURF_R2, C_CONTACT = range(10)
+C_MENU, C_G1, C_G2, C_G3, C_G4, C_G5, C_SURF1, C_SURF2, C_CONTACT = range(9)
 
-def _sos_kb() -> InlineKeyboardMarkup:
+def _sos_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧘 Grounding (5-4-3-2-1)", callback_data="sos:ground")],
-        [InlineKeyboardButton("🫁 Atemübung", callback_data="sos:breathe")],
-        [InlineKeyboardButton("🌊 Urge Surfing", callback_data="sos:surf")],
-        [InlineKeyboardButton("📞 Jemanden anrufen", callback_data="sos:call")],
-        [InlineKeyboardButton("🎯 Ablenkung", callback_data="sos:distract")],
+        [InlineKeyboardButton("🧘 Grounding", callback_data="sos:ground"),
+         InlineKeyboardButton("🫁 Atmen", callback_data="sos:breathe")],
+        [InlineKeyboardButton("🌊 Urge Surfing", callback_data="sos:surf"),
+         InlineKeyboardButton("📞 Anrufen", callback_data="sos:call")],
+        [InlineKeyboardButton("🎯 Distraction", callback_data="sos:distract")],
     ])
 
-def _fb_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("Ja 💚", callback_data="sos:yes"),
-        InlineKeyboardButton("Nein", callback_data="sos:no"),
-    ]])
-
-def _rating_kb(prefix: str) -> InlineKeyboardMarkup:
+def _fb_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(str(n), callback_data=f"sos:{prefix}_{n}") for n in range(1, 6)],
-        [InlineKeyboardButton(str(n), callback_data=f"sos:{prefix}_{n}") for n in range(6, 11)],
+        [InlineKeyboardButton("✅ Ja", callback_data="sos:yes"),
+         InlineKeyboardButton("❌ Nein", callback_data="sos:no")],
     ])
 
-async def cmd_sos(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-    await update.message.reply_text("Ich bin da. Cravings gehen vorbei — lass uns das zusammen durchstehen.")
-    await update.message.reply_text("Wähle ein Werkzeug:", reply_markup=_sos_kb())
+async def sos(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start /sos crisis toolkit."""
+    await update.message.reply_text(
+        "🆘 Crisis Kit — Wähle ein Werkzeug:",
+        reply_markup=_sos_kb()
+    )
     return C_MENU
 
 async def sos_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -446,19 +225,26 @@ async def sos_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await q.answer()
     action = q.data.split(":")[1]
     msg = q.message
+    uid = update.effective_user.id if update.effective_user else 0
 
     if action == "ground":
         await msg.reply_text("🧘 Grounding (5-4-3-2-1)\n\nNenne mir 5 Dinge, die du gerade SIEHST:")
         return C_G1
     if action == "breathe":
-        await _run_breathing(msg)
-        await msg.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
+        asyncio.create_task(_run_breathing(msg))
         return C_MENU
     if action == "surf":
         await msg.reply_text("🌊 Urge Surfing\n\nSchritt 1: Wo spürst du das Craving im Körper?\n(z.B. Brust, Magen, Hände)")
         return C_SURF1
     if action == "call":
-        contact = (ctx.user_data or {}).get("emergency_contact")
+        # Check persisted UserState first, fall back to in-memory
+        contact = None
+        if update.effective_user:
+            user = store(ctx).load(update.effective_user.id)
+            if user and user.emergency_contact:
+                contact = user.emergency_contact
+        if not contact:
+            contact = (ctx.user_data or {}).get("emergency_contact")
         if contact:
             await msg.reply_text(f"Dein Notfallkontakt: {contact}\n\nRuf jetzt an.")
             await msg.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
@@ -471,8 +257,7 @@ async def sos_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             range(12, 17): "💪 Workout | 🍳 Kochen | 🧹 Aufräumen",
             range(17, 22): "📖 Lesen | 🎧 Podcast | 🤸 Stretching",
         }
-        tz = ZoneInfo(TIMEZONE)
-        h = datetime.now(tz).hour
+        h = datetime.now().hour
         tip = next((v for r, v in tips.items() if h in r), "🫁 Atemübung | 🍵 Tee | 📝 Journaling")
         await msg.reply_text(tip)
         await msg.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
@@ -502,6 +287,7 @@ async def _run_breathing(msg: Message) -> None:
         await m.edit_text("✅ 5 Runden geschafft. Spür nach, wie sich dein Körper anfühlt.")
     except Exception:
         pass
+    await msg.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
 
 # Grounding steps
 async def _g_step(update, next_s, prompt):
@@ -520,60 +306,21 @@ async def g5(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return C_MENU
 
 # Urge surfing
-async def surf1(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    if not isinstance(update.effective_message, Message):
-        return ConversationHandler.END
-    ud = ctx.user_data or {}
-    ud["surf_loc"] = update.effective_message.text
-    await update.effective_message.reply_text(
-        "Wie stark ist das Craving? (1-10)", reply_markup=_rating_kb("r1")
-    )
-    return C_SURF_R1
+async def s1(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if isinstance(update.effective_message, Message):
+        await update.effective_message.reply_text("Schritt 2: Wie intensiv (0-10)?")
+    return C_SURF2
 
-async def surf_r1(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    if not q or not q.data or not isinstance(q.message, Message):
-        return ConversationHandler.END
-    await q.answer()
-    try:
-        r = int(q.data.split("_")[1])
-    except (IndexError, ValueError):
-        return ConversationHandler.END
-    ud = ctx.user_data or {}
-    ud["surf_r1"] = r
-    m = await q.message.reply_text(f"Intensität: {r}/10\n\n🌊 Beobachte die Welle... ⏳ 2 Min")
-    # The try/except around edit_text handles cases where the user
-    # cancelled or the message was deleted during the 2-min wait.
-    for sec in [90, 60, 30, 0]:
-        await asyncio.sleep(30)
-        try:
-            await m.edit_text(f"🌊 Beobachte... ⏳ {sec}s" if sec else "🌊 Die 2 Minuten sind um.")
-        except Exception:
-            pass
-    await q.message.reply_text("Wie stark ist das Craving JETZT?", reply_markup=_rating_kb("r2"))
-    return C_SURF_R2
-
-async def surf_r2(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    if not q or not q.data or not isinstance(q.message, Message):
-        return ConversationHandler.END
-    await q.answer()
-    try:
-        r2 = int(q.data.split("_")[1])
-    except (IndexError, ValueError):
-        return ConversationHandler.END
-    r1 = (ctx.user_data or {}).get("surf_r1", r2)
-    diff = r1 - r2
-    if diff > 0:
-        txt = f"Vorher: {r1}/10 → Jetzt: {r2}/10\n\n📉 {diff} Punkte weniger. Die Welle geht vorbei."
-    elif diff == 0:
-        txt = f"Gleich geblieben — das ist okay. Wellen brauchen manchmal länger."
-    else:
-        txt = f"Stärker geworden. Probier noch ein anderes Werkzeug."
-    await q.message.reply_text(txt)
-    await q.message.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
+async def s2(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if isinstance(update.effective_message, Message):
+        await update.effective_message.reply_text(
+            "Gut. Stell dir vor, die Welle steigt, erreicht ihren Höhepunkt und fällt ab.\n"
+            "Es kommt vorbei. Du bist stärker. ⛵"
+        )
+        await update.effective_message.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
     return C_MENU
 
+# Emergency contact
 async def on_contact(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not isinstance(update.effective_message, Message):
         return ConversationHandler.END
@@ -583,6 +330,12 @@ async def on_contact(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         return C_CONTACT
     ud = ctx.user_data or {}
     ud["emergency_contact"] = contact
+    # Persist to UserState for restart resilience
+    if update.effective_user:
+        user = store(ctx).load(update.effective_user.id)
+        if user:
+            user.emergency_contact = contact
+            store(ctx).save(user)
     await update.effective_message.reply_text(f"✅ Notfallkontakt gespeichert: {contact}")
     await update.effective_message.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
     return C_MENU
@@ -604,151 +357,185 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # Intent detection
     intent = detect_intent(text)
     if intent:
-        kind, data = intent
-        if kind == "relapse":
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("Ja, leider", callback_data="rel:yes")],
-                [InlineKeyboardButton("Nein, Missverständnis", callback_data="rel:no")],
-            ])
-            await update.message.reply_text("Hast du wirklich konsumiert?", reply_markup=kb)
-            return
-        if kind == "journal":
-            user.journal.append({"date": datetime.now(ZoneInfo("UTC")).isoformat(), "text": data})
-            store(ctx).save(user)
-            await update.message.reply_text("Gespeichert. 📝")
-            return
-
-    # AI coaching
-    h = hist(ctx)
-    # Restore history from persistent storage on first access
-    if not h.recent(uid, 1) and user.chat_history:
-        for entry in user.chat_history:
-            h.add(uid, entry.get("role", "user"), entry.get("text", ""))
-    history_text = h.format(uid, 6)
-    h.add(uid, "user", text)
-    reply = await ai(ctx).reply(user, text, history_text=history_text)
-    h.add(uid, "coach", reply)
-
-    # Send (handle Telegram 4096 char limit, split at newline boundaries)
-    if len(reply) <= 4096:
-        await update.message.reply_text(reply)
-    else:
-        while reply:
-            if len(reply) <= 4000:
-                await update.message.reply_text(reply)
-                break
-            # Find nearest newline before the 4000-char limit
-            split_at = reply.rfind("\n", 0, 4000)
-            if split_at == -1:
-                split_at = 4000  # No newline found, hard split
-            await update.message.reply_text(reply[:split_at])
-            reply = reply[split_at:].lstrip("\n")
-
-    # Persist recent history to user data for restart resilience
-    user.chat_history = [{"role": t.role, "text": t.text} for t in h.recent(uid, 20)]
-    store(ctx).save(user)
-
-async def on_relapse_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    q = update.callback_query
-    if not q or not q.data or not update.effective_user:
+        await update.message.reply_text(f"Intent: {intent}")
         return
-    await q.answer()
-    user = store(ctx).load(update.effective_user.id)
-    if not user or not q.message:
-        return
-    if q.data == "rel:yes":
-        user.reset_streak()
-        store(ctx).save(user)
-        await q.message.reply_text("Danke für deine Ehrlichkeit. Tag 1. /undo innerhalb 5 Min wenn Fehler.")
-    else:
-        await q.message.reply_text("Danke fürs Klarstellen. Dein Streak bleibt. Du machst das gut.")
+
+    # AI response
+    try:
+        resp = await ai(ctx).chat(text, user)
+        await update.message.reply_text(resp)
+        hist(ctx).add(uid, "user", text)
+        hist(ctx).add(uid, "assistant", resp)
+    except Exception as e:
+        log.error("AI error: %s", e)
+        await update.message.reply_text("AI Fehler. Versuchen Sie es später.")
 
 # ══════════════════════════════════════════════════════════════════════════
-# PROACTIVE MESSAGES (morning, nudge, evening)
+# SAVINGS
 # ══════════════════════════════════════════════════════════════════════════
 
-async def _proactive(app: Application, uid: int, prompt: str) -> None:
-    s: Store = app.bot_data["store"]
-    user = s.load(uid)
+async def savings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show savings or set goal."""
+    if not update.effective_user:
+        return
+    uid = update.effective_user.id
+    user = store(ctx).load(uid)
     if not user:
+        await update.message.reply_text("Start with /start.")
         return
-    client: AIClient = app.bot_data["ai"]
-    if not client.configured():
+    if not user.daily_savings:
+        text = "Kein Sparziel gesetzt. Antworte: /savings 10 (für €10/Tag)"
+    else:
+        days = (date.today() - user.start_date).days if user.start_date else 0
+        total = user.daily_savings * days
+        text = f"💰 Gespart: €{total:.2f}\n📅 {days} Tage à €{user.daily_savings}"
+    await update.message.reply_text(text)
+
+async def on_savings_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set daily savings amount."""
+    if not update.message or not update.message.text or not update.effective_user:
         return
     try:
-        reply = await client.reply(user, prompt)
-        await app.bot.send_message(chat_id=uid, text=reply)
-    except Exception as exc:
-        log.error("Proactive msg failed for %d: %s", uid, exc)
+        text = update.message.text.strip()
+        parts = text.split()
+        amount = float(parts[-1])
+        uid = update.effective_user.id
+        user = store(ctx).load(uid)
+        if user:
+            user.daily_savings = amount
+            store(ctx).save(user)
+            await update.message.reply_text(f"✅ Sparziel: €{amount}/Tag gespeichert.")
+    except Exception:
+        await update.message.reply_text("Format: /savings 10")
 
-async def send_morning(app: Application, uid: int) -> None:
-    s: Store = app.bot_data["store"]
-    user = s.load(uid)
+# ══════════════════════════════════════════════════════════════════════════
+# JOURNALING
+# ══════════════════════════════════════════════════════════════════════════
+
+async def journal(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start journaling."""
+    await update.message.reply_text(
+        "📝 Journal\n\n"
+        "Schreib einen Eintrag, oder:\n"
+        "/journal list — Alle Einträge\n"
+        "/journal 1 — Eintrag 1 lesen"
+    )
+
+async def on_journal_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Save journal entry."""
+    if not update.message or not update.message.text or not update.effective_user:
+        return
+    uid = update.effective_user.id
+    user = store(ctx).load(uid)
     if not user:
         return
-    user.calc_streak()
-    await _proactive(app, uid, (
-        f"Schreibe eine persönliche Morgengrußnachricht. "
-        f"Tag {user.streak_days} clean, {user.savings():.2f}€ gespart. "
-        f"Gewohnheit: {user.habit}. 2-3 Sätze auf Deutsch. Warm und konkret."
-    ))
+    # Simple storage: append to list
+    if not user.journal_entries:
+        user.journal_entries = []
+    user.journal_entries.append({
+        "date": str(date.today()),
+        "text": update.message.text
+    })
+    store(ctx).save(user)
+    await update.message.reply_text(f"✅ Eintrag #{len(user.journal_entries)} gespeichert.")
 
-async def send_nudge(app: Application, uid: int) -> None:
-    s: Store = app.bot_data["store"]
-    user = s.load(uid)
-    if not user:
-        return
-    user.calc_streak()
-    await _proactive(app, uid, (
-        f"Schreibe einen kurzen Mittags-Nudge. Tag {user.streak_days} clean. "
-        f"GENAU ein Satz auf Deutsch. Persönlich, kein Klischee."
-    ))
+# ══════════════════════════════════════════════════════════════════════════
+# QUICK CHECK-IN (/check)
+# ══════════════════════════════════════════════════════════════════════════
 
-async def send_evening(app: Application, uid: int) -> None:
-    s: Store = app.bot_data["store"]
-    user = s.load(uid)
-    if not user:
+async def check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Quick mood check-in."""
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("😊", callback_data="mood:great"),
+         InlineKeyboardButton("😐", callback_data="mood:ok"),
+         InlineKeyboardButton("😢", callback_data="mood:bad")],
+    ])
+    await update.message.reply_text("Wie geht es dir?", reply_markup=kb)
+
+async def on_mood(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Save mood."""
+    q = update.callback_query
+    if not q or not q.data:
         return
-    user.calc_streak()
-    await _proactive(app, uid, (
-        f"Schreibe eine Abendreflexion. Tag {user.streak_days} clean, {user.savings():.2f}€ gespart. "
-        f"Gewohnheit: {user.habit}. Tagesrückblick, Anerkennung. 2-3 Sätze Deutsch."
-    ))
+    await q.answer()
+    mood = q.data.split(":")[1]
+    uid = update.effective_user.id if update.effective_user else 0
+    user = store(ctx).load(uid)
+    if user:
+        user.last_mood = mood
+        store(ctx).save(user)
+    await q.message.reply_text(f"✅ Mood gespeichert: {mood}")
+
+# ══════════════════════════════════════════════════════════════════════════
+# SCHEDULED MESSAGES (morning, nudge, evening)
+# ══════════════════════════════════════════════════════════════════════════
+
+async def _send_morning(app: Application, uid: int) -> None:
+    """Send morning briefing (scheduled)."""
+    try:
+        user = store(app.bot_data["store"]).load(uid)
+        if not user:
+            return
+        msg = f"🌅 Guten Morgen, {user.name}!\n\nStreik: {(date.today() - user.start_date).days if user.start_date else 0} Tage 🔥"
+        await app.bot.send_message(uid, msg)
+    except Exception as e:
+        log.error("Morning message error: %s", e)
+
+async def _send_nudge(app: Application, uid: int) -> None:
+    """Midday nudge (scheduled)."""
+    try:
+        msg = "💪 Wie geht's? Komm zur /check."
+        await app.bot.send_message(uid, msg)
+    except Exception as e:
+        log.error("Nudge error: %s", e)
+
+async def _send_evening(app: Application, uid: int) -> None:
+    """Evening reflection (scheduled)."""
+    try:
+        msg = "🌙 Gute Nacht! Journaling: /journal oder weiter mit /sos?"
+        await app.bot.send_message(uid, msg)
+    except Exception as e:
+        log.error("Evening message error: %s", e)
 
 def _schedule_user_jobs(app: Application, user: UserState) -> None:
-    tz = ZoneInfo(user.timezone or TIMEZONE)
-    wake = _parse_time(user.wake_time)
+    """Schedule daily jobs for user (morning, nudge, evening)."""
+    if not user:
+        return
     jq = cast(JobQueue, app.job_queue)
-    uid = user.user_id
+    tz = ZoneInfo(user.timezone or TIMEZONE)
+    wake = _parse_time(user.wake_time or "07:30")
 
-    # Remove old jobs for this user
-    for name in [f"m_{uid}", f"n_{uid}", f"e_{uid}"]:
-        for job in jq.get_jobs_by_name(name):
-            job.schedule_removal()
+    # Morning
+    jq.run_daily(
+        lambda c: _send_morning(app, user.user_id),
+        time=time(wake.hour, wake.minute, tzinfo=tz),
+        name=f"morning_{user.user_id}",
+    )
+    # Nudge: wake + 6h
+    nudge_t = (datetime.combine(date.today(), wake) + timedelta(hours=6)).time()
+    jq.run_daily(
+        lambda c: _send_nudge(app, user.user_id),
+        time=time(nudge_t.hour, nudge_t.minute, tzinfo=tz),
+        name=f"nudge_{user.user_id}",
+    )
+    # Evening
+    jq.run_daily(
+        lambda c: _send_evening(app, user.user_id),
+        time=time(21, 0, tzinfo=tz),
+        name=f"evening_{user.user_id}",
+    )
 
-    jq.run_daily(lambda c: send_morning(app, uid), time=time(wake.hour, wake.minute, tzinfo=tz), name=f"m_{uid}")
-    nudge_dt = (datetime.combine(datetime.now(ZoneInfo(user.timezone or TIMEZONE)).date(), wake) + timedelta(hours=6)).time()
-    jq.run_daily(lambda c: send_nudge(app, uid), time=time(nudge_dt.hour, nudge_dt.minute, tzinfo=tz), name=f"n_{uid}")
-    jq.run_daily(lambda c: send_evening(app, uid), time=time(21, 0, tzinfo=tz), name=f"e_{uid}")
+HELP_TEXT = """
+/sos — Crisis Toolkit (grounding, breathing, urge surfing, call, distract)
+/status — Streak, Erspartes, Mood
+/savings [€] — Sparziel setzen
+/check — Quick Mood Check
+/journal — Tagebucheintrag
+/undo — Reset rückgängig
+/help — Dieser Text
+"""
 
-# ══════════════════════════════════════════════════════════════════════════
-# HELP
-# ══════════════════════════════════════════════════════════════════════════
-
-HELP_TEXT = (
-    "Ich bin dein Unhooked Coach. Schreib mir jederzeit.\n\n"
-    "/status — Streak, Erspartes\n"
-    "/savings — Geld gespart / Ziel setzen\n"
-    "/undo — Reset rückgängig (5 Min)\n"
-    "/check 7 3 2 — Stimmung/Craving/Stress\n"
-    "/sos — Crisis Toolkit\n"
-    "/journal — Tagebuch\n"
-    "/settings — (coming soon)\n"
-    "/help — Diese Hilfe\n\n"
-    "Oder schreib einfach frei — ich bin dein Coach."
-)
-
-async def cmd_help(update: Update, _) -> None:
+async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
         await update.message.reply_text(HELP_TEXT)
 
@@ -767,7 +554,8 @@ async def post_init(app: Application) -> None:
         BotCommand("help", "Alle Befehle"),
     ])
     s: Store = app.bot_data["store"]
-    for user in s.all_users():
+    users = await asyncio.to_thread(s.all_users)
+    for user in users:
         _schedule_user_jobs(app, user)
 
 def main() -> None:
@@ -786,65 +574,59 @@ def main() -> None:
     app.add_handler(TypeHandler(Update, _guard), group=-1)
 
     # Onboarding conversation
-    app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("start", cmd_start)],
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
         states={
-            S_HABIT: [CallbackQueryHandler(on_habit, pattern=r"^h:")],
-            S_HABIT_TXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_habit_text)],
-            S_LAST: [CallbackQueryHandler(on_last_use, pattern=r"^l:")],
-            S_WAKE: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_wake)],
-            S_SAVINGS: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_savings)],
-            S_TRIG: [CallbackQueryHandler(on_trigger, pattern=r"^t:")],
-            S_WHY: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_why)],
+            1: [MessageHandler(filters.TEXT, on_name)],
         },
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
-    ))
+        fallbacks=[],
+    )
+    app.add_handler(conv)
 
-    # Journal conversation
-    app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("journal", cmd_journal)],
-        states={J_WRITE: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_journal_text)]},
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
-    ))
+    # Streak commands
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("reset", reset_streak))
+    app.add_handler(CommandHandler("undo", undo_reset))
 
-    # Crisis toolkit conversation
-    txt_filter = filters.TEXT & ~filters.COMMAND
-    app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("sos", cmd_sos), CommandHandler("craving", cmd_sos)],
+    # Crisis toolkit /sos
+    sos_conv = ConversationHandler(
+        entry_points=[CommandHandler("sos", sos)],
         states={
-            C_MENU: [CallbackQueryHandler(sos_menu, pattern=r"^sos:")],
-            C_G1: [MessageHandler(txt_filter, g1)],
-            C_G2: [MessageHandler(txt_filter, g2)],
-            C_G3: [MessageHandler(txt_filter, g3)],
-            C_G4: [MessageHandler(txt_filter, g4)],
-            C_G5: [MessageHandler(txt_filter, g5)],
-            C_SURF1: [MessageHandler(txt_filter, surf1)],
-            C_SURF_R1: [CallbackQueryHandler(surf_r1, pattern=r"^sos:r1_")],
-            C_SURF_R2: [CallbackQueryHandler(surf_r2, pattern=r"^sos:r2_")],
-            C_CONTACT: [MessageHandler(txt_filter, on_contact)],
+            C_MENU: [CallbackQueryHandler(sos_menu)],
+            C_G1: [MessageHandler(filters.TEXT, g1)],
+            C_G2: [MessageHandler(filters.TEXT, g2)],
+            C_G3: [MessageHandler(filters.TEXT, g3)],
+            C_G4: [MessageHandler(filters.TEXT, g4)],
+            C_G5: [MessageHandler(filters.TEXT, g5)],
+            C_SURF1: [MessageHandler(filters.TEXT, s1)],
+            C_SURF2: [MessageHandler(filters.TEXT, s2)],
+            C_CONTACT: [MessageHandler(filters.TEXT, on_contact)],
         },
-        fallbacks=[CommandHandler("cancel", cmd_cancel), CommandHandler("sos", cmd_sos)],
-        allow_reentry=True,
-    ))
+        fallbacks=[CommandHandler("sos", sos)],
+    )
+    app.add_handler(sos_conv)
 
-    # Simple commands
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("streak", cmd_status))
-    app.add_handler(CommandHandler("why", cmd_why))
-    app.add_handler(CommandHandler("reset", cmd_reset))
-    app.add_handler(CommandHandler("undo", cmd_undo))
-    app.add_handler(CommandHandler("savings", cmd_savings))
-    app.add_handler(CommandHandler("check", cmd_check))
-    app.add_handler(CommandHandler("help", cmd_help))
+    # Savings
+    app.add_handler(CommandHandler("savings", savings))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^\d+"), on_savings_amount))
 
-    # Relapse confirmation callback
-    app.add_handler(CallbackQueryHandler(on_relapse_cb, pattern=r"^rel:"))
+    # Journaling
+    app.add_handler(CommandHandler("journal", journal))
 
-    # Free-text AI coaching (catch-all — must be last)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    # Check-in / mood
+    app.add_handler(CommandHandler("check", check))
+    app.add_handler(CallbackQueryHandler(on_mood, pattern=r"^mood:"))
 
+    # Free-text AI coaching
+    app.add_handler(MessageHandler(filters.TEXT, on_text))
+
+    # Help
+    app.add_handler(CommandHandler("help", help_cmd))
+
+    # Post-init setup (schedule jobs)
     app.post_init = post_init
-    log.info("Starting Unhooked Lite")
+
+    log.info("Starting Unhooked Lite bot")
     app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
