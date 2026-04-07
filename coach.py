@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import NamedTuple
 
 from anthropic import AsyncAnthropic
@@ -101,6 +101,8 @@ class AIClient:
     model: str = "gpt-4o"
     openai_key: str | None = None
     anthropic_key: str | None = None
+    _oa_client: AsyncOpenAI | None = field(default=None, init=False, repr=False)
+    _ant_client: AsyncAnthropic | None = field(default=None, init=False, repr=False)
 
     def configured(self) -> bool:
         if self.provider == "anthropic":
@@ -122,8 +124,9 @@ class AIClient:
             return "Pause. Atme 4-4-8 — dann schreib mir, was als Nächstes kommt."
 
     async def _openai(self, system: str, message: str) -> str:
-        client = AsyncOpenAI(api_key=self.openai_key)
-        r = await client.chat.completions.create(
+        if self._oa_client is None:
+            self._oa_client = AsyncOpenAI(api_key=self.openai_key)
+        r = await self._oa_client.chat.completions.create(
             model=self.model,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": message}],
             temperature=0.5,
@@ -134,8 +137,9 @@ class AIClient:
         return r.choices[0].message.content or _FALLBACK_REPLY
 
     async def _anthropic(self, system: str, message: str) -> str:
-        client = AsyncAnthropic(api_key=self.anthropic_key)
-        r = await client.messages.create(
+        if self._ant_client is None:
+            self._ant_client = AsyncAnthropic(api_key=self.anthropic_key)
+        r = await self._ant_client.messages.create(
             model=self.model,
             max_tokens=300,
             system=system,
