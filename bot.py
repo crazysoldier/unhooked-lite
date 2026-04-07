@@ -21,6 +21,7 @@ import random
 from datetime import date, datetime, time, timedelta
 from typing import Any, cast
 from zoneinfo import ZoneInfo
+from dotenv import load_dotenv
 
 from telegram import (
     BotCommand,
@@ -50,6 +51,7 @@ log = logging.getLogger("unhooked")
 
 # ── Config ────────────────────────────────────────────────────────────────
 
+load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 AI_PROVIDER = os.getenv("AI_PROVIDER", "openai").lower()
 AI_MODEL = os.getenv("AI_MODEL", "gpt-4o")
@@ -59,7 +61,13 @@ TIMEZONE = os.getenv("TIMEZONE", "Europe/Vienna")
 DATA_DIR = os.getenv("DATA_DIR", "./data")
 
 _raw_ids = os.getenv("ALLOWED_TELEGRAM_CHAT_IDS", "")
-ALLOWED_IDS: set[int] = {int(x) for x in _raw_ids.split(",") if x.strip()} if _raw_ids.strip() else set()
+ALLOWED_IDS: set[int] = set()
+for x in _raw_ids.split(","):
+    if x.strip():
+        try:
+            ALLOWED_IDS.add(int(x.strip()))
+        except ValueError:
+            log.error(f"Invalid ID in ALLOWED_TELEGRAM_CHAT_IDS: {x}")
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -201,7 +209,7 @@ async def on_why(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ud = ctx.user_data or {}
     why = (update.message.text or "").strip()
     quit_days = ud.get("quit_days", 0)
-    quit_date = date.fromordinal(date.today().toordinal() - quit_days)
+    quit_date = date.today() - timedelta(days=quit_days)
     user = UserState(
         user_id=update.effective_user.id,
         username=update.effective_user.username or "",
@@ -340,7 +348,7 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     mood = vals[0] if vals else 5
     craving = vals[1] if len(vals) > 1 else None
     stress = vals[2] if len(vals) > 2 else None
-    entry = {"date": datetime.utcnow().isoformat(), "morning": mood}
+    entry = {"date": datetime.now(ZoneInfo("UTC")).isoformat(), "morning": mood}
     user.mood_log.append(entry)
     store(ctx).save(user)
     parts = [f"Stimmung: {mood}/10"]
@@ -392,7 +400,7 @@ async def on_journal_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
     if not text:
         await update.message.reply_text("Schreib einfach deinen Gedanken — oder /cancel.")
         return J_WRITE
-    user.journal.append({"date": datetime.utcnow().isoformat(), "text": text})
+    user.journal.append({"date": datetime.now(ZoneInfo("UTC")).isoformat(), "text": text})
     store(ctx).save(user)
     await update.message.reply_text("Gespeichert. Starker Move — Bewusstsein schlägt Autopilot. 📝")
     return ConversationHandler.END
@@ -458,7 +466,8 @@ async def sos_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             range(12, 17): "💪 Workout | 🍳 Kochen | 🧹 Aufräumen",
             range(17, 22): "📖 Lesen | 🎧 Podcast | 🤸 Stretching",
         }
-        h = datetime.now().hour
+        tz = ZoneInfo(TIMEZONE)
+        h = datetime.now(tz).hour
         tip = next((v for r, v in tips.items() if h in r), "🫁 Atemübung | 🍵 Tee | 📝 Journaling")
         await msg.reply_text(tip)
         await msg.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
@@ -599,7 +608,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("Hast du wirklich konsumiert?", reply_markup=kb)
             return
         if kind == "journal":
-            user.journal.append({"date": datetime.utcnow().isoformat(), "text": data})
+            user.journal.append({"date": datetime.now(ZoneInfo("UTC")).isoformat(), "text": data})
             store(ctx).save(user)
             await update.message.reply_text("Gespeichert. 📝")
             return
