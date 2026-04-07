@@ -29,6 +29,7 @@ class UserState:
     savings_goal: float = 0.0
     mood_log: list[dict] = field(default_factory=list)
     journal: list[dict] = field(default_factory=list)
+    chat_history: list[dict] = field(default_factory=list)
     emergency_contact: str = ""
     last_relapse_reset: dict | None = None
     created_at: str = field(default_factory=lambda: datetime.now(ZoneInfo("UTC")).isoformat())
@@ -106,7 +107,7 @@ class Store:
         if not p.exists():
             return None
         try:
-            return UserState.from_dict(json.loads(p.read_text()))
+            return UserState.from_dict(json.loads(p.read_text(encoding="utf-8")))
         except (json.JSONDecodeError, TypeError) as exc:
             logger.error("Corrupted data file %s: %s", p, exc)
             return None
@@ -114,14 +115,14 @@ class Store:
     def save(self, user: UserState) -> None:
         path = self._path(user.user_id)
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(user.to_dict(), ensure_ascii=False, indent=2))
+        tmp.write_text(json.dumps(user.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(path)
 
     def all_users(self) -> list[UserState]:
         users: list[UserState] = []
         for f in self.base.glob("*.json"):
             try:
-                users.append(UserState.from_dict(json.loads(f.read_text())))
+                users.append(UserState.from_dict(json.loads(f.read_text(encoding="utf-8"))))
             except (json.JSONDecodeError, TypeError) as exc:
                 logger.error("Skipping corrupted data file %s: %s", f, exc)
         return users
