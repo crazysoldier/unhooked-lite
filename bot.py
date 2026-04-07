@@ -10,6 +10,7 @@ Replaces the original's 40+ files with a single entry point that handles:
 - Quick mood check-in (/check)
 - Proactive scheduled messages (morning, nudge, evening)
 - Chat whitelist security
+
 """
 
 from __future__ import annotations
@@ -119,7 +120,7 @@ S_HABIT, S_HABIT_TXT, S_LAST, S_WAKE, S_SAVINGS, S_TRIG, S_WHY = range(7)
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not update.message:
         return ConversationHandler.END
-    kb = [[InlineKeyboardButton(label, callback_data=f"h:{name or 'other'}\")] for label, name in HABITS]
+    kb = [[InlineKeyboardButton(label, callback_data=f"h:{name or 'other'}") for label, name in HABITS]]
     await update.message.reply_text("Hey. Ich bin dein Unhooked Coach. Bereit, die Kontrolle zurückzuholen?")
     await update.message.reply_text("Was möchtest du verändern?", reply_markup=InlineKeyboardMarkup(kb))
     return S_HABIT
@@ -208,7 +209,7 @@ async def on_why(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ud = ctx.user_data or {}
     why = (update.message.text or "").strip()
     quit_days = ud.get("quit_days", 0)
-    quit_date = date.today() - timedelta(days=quit_days)
+    quit_date = datetime.now(ZoneInfo(TIMEZONE)).date() - timedelta(days=quit_days)
     user = UserState(
         user_id=update.effective_user.id,
         username=update.effective_user.username or "",
@@ -347,7 +348,7 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     mood = vals[0] if vals else 5
     craving = vals[1] if len(vals) > 1 else None
     stress = vals[2] if len(vals) > 2 else None
-    entry = {"date": datetime.now(ZoneInfo("UTC")).isoformat(), "morning": mood}
+    entry = {"date": datetime.now(ZoneInfo("UTC")).isoformat(), "morning": mood, "craving": craving, "stress": stress}
     user.mood_log.append(entry)
     store(ctx).save(user)
     parts = [f"Stimmung: {mood}/10"]
@@ -424,6 +425,12 @@ def _fb_kb() -> InlineKeyboardMarkup:
         InlineKeyboardButton("Ja 💚", callback_data="sos:yes"),
         InlineKeyboardButton("Nein", callback_data="sos:no"),
     ]])
+
+def _rating_kb(prefix: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(str(n), callback_data=f"sos:{prefix}_{n}") for n in range(1, 6)],
+        [InlineKeyboardButton(str(n), callback_data=f"sos:{prefix}_{n}") for n in range(6, 11)],
+    ])
 
 async def cmd_sos(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not update.message:
@@ -518,12 +525,8 @@ async def surf1(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     ud = ctx.user_data or {}
     ud["surf_loc"] = update.effective_message.text
-    _rk = lambda p: InlineKeyboardMarkup([
-        [InlineKeyboardButton(str(n), callback_data=f"sos:{p}_{n}") for n in range(1, 6)],
-        [InlineKeyboardButton(str(n), callback_data=f"sos:{p}_{n}") for n in range(6, 11)],
-    ])
     await update.effective_message.reply_text(
-        "Wie stark ist das Craving? (1-10)", reply_markup=_rk("r1")
+        "Wie stark ist das Craving? (1-10)", reply_markup=_rating_kb("r1")
     )
     return C_SURF_R1
 
@@ -542,11 +545,7 @@ async def surf_r1(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             await m.edit_text(f"🌊 Beobachte... ⏳ {sec}s" if sec else "🌊 Die 2 Minuten sind um.")
         except Exception:
             pass
-    _rk = lambda p: InlineKeyboardMarkup([
-        [InlineKeyboardButton(str(n), callback_data=f"sos:{p}_{n}") for n in range(1, 6)],
-        [InlineKeyboardButton(str(n), callback_data=f"sos:{p}_{n}") for n in range(6, 11)],
-    ])
-    await q.message.reply_text("Wie stark ist das Craving JETZT?", reply_markup=_rk("r2"))
+    await q.message.reply_text("Wie stark ist das Craving JETZT?", reply_markup=_rating_kb("r2"))
     return C_SURF_R2
 
 async def surf_r2(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -704,7 +703,7 @@ def _schedule_user_jobs(app: Application, user: UserState) -> None:
             job.schedule_removal()
 
     jq.run_daily(lambda c: send_morning(app, uid), time=time(wake.hour, wake.minute, tzinfo=tz), name=f"m_{uid}")
-    nudge_dt = (datetime.combine(date.today(), wake) + timedelta(hours=6)).time()
+    nudge_dt = (datetime.combine(datetime.now(ZoneInfo(user.timezone or TIMEZONE)).date(), wake) + timedelta(hours=6)).time()
     jq.run_daily(lambda c: send_nudge(app, uid), time=time(nudge_dt.hour, nudge_dt.minute, tzinfo=tz), name=f"n_{uid}")
     jq.run_daily(lambda c: send_evening(app, uid), time=time(21, 0, tzinfo=tz), name=f"e_{uid}")
 
