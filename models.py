@@ -42,8 +42,12 @@ class UserState:
         valid = {f.name for f in cls.__dataclass_fields__.values()}
         return cls(**{k: v for k, v in data.items() if k in valid})
 
+    def _today(self) -> date:
+        """Return today's date in the user's configured timezone."""
+        return datetime.now(ZoneInfo(self.timezone)).date()
+
     def calc_streak(self, today: date | None = None) -> int:
-        base = today or date.today()
+        base = today or self._today()
         try:
             quit = date.fromisoformat(self.quit_date)
         except ValueError:
@@ -64,7 +68,7 @@ class UserState:
             "reset_at": datetime.now(ZoneInfo("UTC")).isoformat(),
         }
         self.relapses += 1
-        self.quit_date = (reset_date or date.today()).isoformat()
+        self.quit_date = (reset_date or self._today()).isoformat()
         self.streak_days = 1
 
     def undo_reset(self, window_s: int = 300) -> bool:
