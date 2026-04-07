@@ -1,4 +1,5 @@
 python-telegram-bot[job-queue]==21.10
 python-dotenv==1.0.1
+tzdata
 openai==1.65.2
 anthropic==0.49.0
