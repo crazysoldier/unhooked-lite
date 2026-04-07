@@ -18,10 +18,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import random
 from datetime import date, datetime, time, timedelta
-from typing import Any, cast
+from typing import cast
 from zoneinfo import ZoneInfo
+from dotenv import load_dotenv
 
 from telegram import (
     BotCommand,
@@ -51,6 +51,7 @@ log = logging.getLogger("unhooked")
 
 # ── Config ────────────────────────────────────────────────────────────────
 
+load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 AI_PROVIDER = os.getenv("AI_PROVIDER", "openai").lower()
 AI_MODEL = os.getenv("AI_MODEL", "gpt-4o")
@@ -65,569 +66,736 @@ except Exception:
 DATA_DIR = os.getenv("DATA_DIR", "./data")
 
 _raw_ids = os.getenv("ALLOWED_TELEGRAM_CHAT_IDS", "")
-ALLOWED_IDS: set[int] = {int(x) for x in _raw_ids.split(",") if x.strip()} if _raw_ids.strip() else set()
+ALLOWED_IDS: set[int] = set()
+for x in _raw_ids.split(","):
+    if x.strip():
+        try:
+            ALLOWED_IDS.add(int(x.strip()))
+        except ValueError:
+            pass
+
+# ── Conversation states ───────────────────────────────────────────────────
+
+START, REGISTER, CONTACT, JOURNAL, EMERGENCY_CONTACT = range(5)
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 
-def store(ctx: ContextTypes.DEFAULT_TYPE) -> Store:
-    return ctx.bot_data["store"]
 
-def ai(ctx: ContextTypes.DEFAULT_TYPE) -> AIClient:
-    return ctx.bot_data["ai"]
+def _get_tz() -> ZoneInfo:
+    """Get the bot's timezone."""
+    return ZoneInfo(TIMEZONE)
 
-def hist(ctx: ContextTypes.DEFAULT_TYPE) -> History:
-    return ctx.bot_data["history"]
 
-def _parse_time(s: str) -> time:
-    try:
-        h, m = s.split(":")
-        return time(int(h), int(m))
-    except Exception:
-        return time(7, 30)
+def _now() -> datetime:
+    """Get the current time in the bot's timezone."""
+    return datetime.now(_get_tz())
 
-# ── Security ──────────────────────────────────────────────────────────────
 
-async def _guard(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+def _today() -> date:
+    """Get today's date in the bot's timezone."""
+    return _now().date()
+
+
+def _log_command(user_id: int, cmd: str) -> None:
+    """Log a command execution."""
+    log.info("[user=%s] /%s", user_id, cmd)
+
+
+async def _check_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Check if user is in the whitelist. If not, send a denial message."""
     if not ALLOWED_IDS:
-        return
-    chat = update.effective_chat
-    if chat and chat.id in ALLOWED_IDS:
-        return
-    if not ctx.chat_data.get("denied"):
-        msg = update.effective_message
-        if msg:
-            await msg.reply_text("Private Beta. Zugang noch nicht freigeschaltet.")
-        ctx.chat_data["denied"] = True
-    raise ApplicationHandlerStop
+        # No whitelist configured, allow all
+        return True
 
-# ══════════════════════════════════════════════════════════════════════════
-# ONBOARDING  (/start)
-# ══════════════════════════════════════════════════════════════════════════
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id not in ALLOWED_IDS:
+        await update.message.reply_text("Sorry, you are not authorized to use this bot.")
+        return False
+    return True
 
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start — onboarding flow."""
-    if not isinstance(update.effective_user, Update):
-        await update.message.reply_text("Whoops, system error.")
-        return
-    uid = update.effective_user.id
-    user = store(ctx).load(uid)
-    if user:
-        await update.message.reply_text(f"👋 Willkommen zurück, {user.name}!")
-        return
-    # New user
-    ctx.user_data = ctx.user_data or {}
-    ctx.user_data["uid"] = uid
-    await update.message.reply_text("👋 Willkommen bei Unhooked Lite.\n\nWie heißt du?")
 
-async def on_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Save user name and create account."""
-    if not update.message or not update.message.text:
-        return
-    name = update.message.text.strip()
-    uid = ctx.user_data.get("uid") if ctx.user_data else 0
-    if not uid:
-        await update.message.reply_text("Fehler. Bitte /start erneut.")
-        return
-    user = UserState(user_id=uid, name=name)
-    store(ctx).save(user)
-    ctx.user_data = {}  # reset
-    await update.message.reply_text(
-        f"Gut, {name}! 👋\n\nUnhooked Lite ist dein Begleiter für:\n"
-        "✅ Streak tracking\n"
-        "✅ Crisis toolkit (/sos)\n"
-        "✅ AI coaching\n"
-        "✅ Journaling\n\n"
-        "Starten wir! /sos für Soforthilfe, oder schreib mir eine Nachricht."
-    )
-
-# ══════════════════════════════════════════════════════════════════════════
-# STREAK & STATUS
-# ══════════════════════════════════════════════════════════════════════════
-
-async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show current streak, savings, mood."""
-    if not update.effective_user:
-        return
-    uid = update.effective_user.id
-    user = store(ctx).load(uid)
-    if not user:
-        await update.message.reply_text("Starten Sie mit /start.")
-        return
-    days = (date.today() - user.start_date).days if user.start_date else 0
-    savings = user.daily_savings * days if user.daily_savings else 0
-    mood_str = f"Mood: {user.last_mood}" if user.last_mood else "Mood: ?"
-    text = f"📊 Status\n\n🔥 Streak: {days} days\n💰 Saved: €{savings:.2f}\n{mood_str}"
-    await update.message.reply_text(text)
-
-async def reset_streak(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Reset streak to 0."""
-    if not update.effective_user:
-        return
-    uid = update.effective_user.id
-    user = store(ctx).load(uid)
-    if not user:
-        await update.message.reply_text("Start with /start.")
-        return
-    # Save old date for undo
-    ctx.user_data = ctx.user_data or {}
-    ctx.user_data["last_start_date"] = user.start_date
-    user.start_date = date.today()
-    store(ctx).save(user)
-    await update.message.reply_text("🔄 Streak zurückgesetzt.")
-
-async def undo_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Undo last reset."""
-    if not update.effective_user:
-        return
-    uid = update.effective_user.id
-    user = store(ctx).load(uid)
-    if not user or not (ctx.user_data and ctx.user_data.get("last_start_date")):
-        await update.message.reply_text("Nichts zum rückgängig machen.")
-        return
-    user.start_date = ctx.user_data["last_start_date"]
-    store(ctx).save(user)
-    ctx.user_data["last_start_date"] = None
-    await update.message.reply_text("↩️ Reset rückgängig gemacht.")
-
-# ══════════════════════════════════════════════════════════════════════════
-# CRISIS TOOLKIT (/sos)
-# ══════════════════════════════════════════════════════════════════════════
-
-C_MENU, C_G1, C_G2, C_G3, C_G4, C_G5, C_SURF1, C_SURF2, C_CONTACT = range(9)
-
-def _sos_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧘 Grounding", callback_data="sos:ground"),
-         InlineKeyboardButton("🫁 Atmen", callback_data="sos:breathe")],
-        [InlineKeyboardButton("🌊 Urge Surfing", callback_data="sos:surf"),
-         InlineKeyboardButton("📞 Anrufen", callback_data="sos:call")],
-        [InlineKeyboardButton("🎯 Distraction", callback_data="sos:distract")],
-    ])
-
-def _fb_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Ja", callback_data="sos:yes"),
-         InlineKeyboardButton("❌ Nein", callback_data="sos:no")],
-    ])
-
-async def sos(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    """Start /sos crisis toolkit."""
-    await update.message.reply_text(
-        "🆘 Crisis Kit — Wähle ein Werkzeug:",
-        reply_markup=_sos_kb()
-    )
-    return C_MENU
-
-async def sos_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    if not q or not q.data or not isinstance(q.message, Message):
-        return ConversationHandler.END
-    await q.answer()
-    action = q.data.split(":")[1]
-    msg = q.message
-    uid = update.effective_user.id if update.effective_user else 0
-
-    if action == "ground":
-        await msg.reply_text("🧘 Grounding (5-4-3-2-1)\n\nNenne mir 5 Dinge, die du gerade SIEHST:")
-        return C_G1
-    if action == "breathe":
-        asyncio.create_task(_run_breathing(msg))
-        return C_MENU
-    if action == "surf":
-        await msg.reply_text("🌊 Urge Surfing\n\nSchritt 1: Wo spürst du das Craving im Körper?\n(z.B. Brust, Magen, Hände)")
-        return C_SURF1
-    if action == "call":
-        # Check persisted UserState first, fall back to in-memory
-        contact = None
-        if update.effective_user:
-            user = store(ctx).load(update.effective_user.id)
-            if user and user.emergency_contact:
-                contact = user.emergency_contact
-        if not contact:
-            contact = (ctx.user_data or {}).get("emergency_contact")
-        if contact:
-            await msg.reply_text(f"Dein Notfallkontakt: {contact}\n\nRuf jetzt an.")
-            await msg.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
-            return C_MENU
-        await msg.reply_text("Schick mir einen Namen oder eine Nummer:")
-        return C_CONTACT
-    if action == "distract":
-        tips = {
-            range(5, 12): "🚶 15 Min spazieren | 🧘 Yoga | 🚿 Kalt duschen",
-            range(12, 17): "💪 Workout | 🍳 Kochen | 🧹 Aufräumen",
-            range(17, 22): "📖 Lesen | 🎧 Podcast | 🤸 Stretching",
-        }
-        h = datetime.now().hour
-        tip = next((v for r, v in tips.items() if h in r), "🫁 Atemübung | 🍵 Tee | 📝 Journaling")
-        await msg.reply_text(tip)
-        await msg.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
-        return C_MENU
-    if action == "yes":
-        await msg.reply_text("Stark. Du hast das geschafft. 💪")
-        return ConversationHandler.END
-    if action == "no":
-        await msg.reply_text("Probier ein anderes Werkzeug:", reply_markup=_sos_kb())
-        return C_MENU
-    return C_MENU
-
-async def _run_breathing(msg: Message) -> None:
-    m = await msg.reply_text("🫁 Atemübung startet...")
-    await asyncio.sleep(2)
-    for i in range(1, 6):
-        try:
-            await m.edit_text(f"Runde {i}/5\n\n🫁 Einatmen... 4s")
-            await asyncio.sleep(4)
-            await m.edit_text(f"Runde {i}/5\n\n⏸️ Halten... 2s")
-            await asyncio.sleep(2)
-            await m.edit_text(f"Runde {i}/5\n\n💨 Ausatmen... 6s")
-            await asyncio.sleep(6)
-        except Exception:
-            break
+async def _send_markdown(msg: Message, text: str) -> None:
+    """Send markdown-formatted text."""
     try:
-        await m.edit_text("✅ 5 Runden geschafft. Spür nach, wie sich dein Körper anfühlt.")
-    except Exception:
-        pass
-    await msg.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
+        await msg.reply_text(text, parse_mode="Markdown")
+    except Exception as e:
+        log.warning("Markdown rendering failed: %s. Sending as plain text.", e)
+        await msg.reply_text(text)
 
-# Grounding steps
-async def _g_step(update, next_s, prompt):
-    if isinstance(update.effective_message, Message):
-        await update.effective_message.reply_text(prompt)
-    return next_s
 
-async def g1(u, c): return await _g_step(u, C_G2, "👂 Gut. 4 Dinge, die du HÖRST:")
-async def g2(u, c): return await _g_step(u, C_G3, "✋ 3 Dinge, die du FÜHLST/BERÜHRST:")
-async def g3(u, c): return await _g_step(u, C_G4, "👃 2 Dinge, die du RIECHST:")
-async def g4(u, c): return await _g_step(u, C_G5, "👅 1 Ding, das du SCHMECKST:")
-async def g5(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    if isinstance(update.effective_message, Message):
-        await update.effective_message.reply_text("Gut gemacht. Du bist hier. Du bist sicher. 💚")
-        await update.effective_message.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
-    return C_MENU
+# ── Onboarding ───────────────────────────────────────────────────────────
 
-# Urge surfing
-async def s1(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    if isinstance(update.effective_message, Message):
-        await update.effective_message.reply_text("Schritt 2: Wie intensiv (0-10)?")
-    return C_SURF2
 
-async def s2(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    if isinstance(update.effective_message, Message):
-        await update.effective_message.reply_text(
-            "Gut. Stell dir vor, die Welle steigt, erreicht ihren Höhepunkt und fällt ab.\n"
-            "Es kommt vorbei. Du bist stärker. ⛵"
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle /start command."""
+    if not await _check_whitelist(update, context):
+        return -1
+
+    user_id = update.effective_user.id
+    _log_command(user_id, "start")
+
+    store = Store(DATA_DIR)
+    state = store.get_user(user_id)
+
+    if state and state.name:
+        msg = (
+            f"Welcome back, {state.name}! 👋\n\n"
+            "What would you like to do?\n\n"
+            "• /status - Check your streak\n"
+            "• /sos - Crisis toolkit\n"
+            "• /journal - Write in your journal\n"
+            "• /check - Quick mood check-in\n"
+            "• /savings - View savings progress\n"
+            "• /help - Show all commands"
         )
-        await update.effective_message.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
-    return C_MENU
+        await update.message.reply_text(msg)
+        return -1
 
-# Emergency contact
-async def on_contact(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    if not isinstance(update.effective_message, Message):
-        return ConversationHandler.END
-    contact = (update.effective_message.text or "").strip()
-    if not contact:
-        await update.effective_message.reply_text("Bitte schick mir einen Namen oder Nummer:")
-        return C_CONTACT
-    ud = ctx.user_data or {}
-    ud["emergency_contact"] = contact
-    # Persist to UserState for restart resilience
-    if update.effective_user:
-        user = store(ctx).load(update.effective_user.id)
-        if user:
-            user.emergency_contact = contact
-            store(ctx).save(user)
-    await update.effective_message.reply_text(f"✅ Notfallkontakt gespeichert: {contact}")
-    await update.effective_message.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
-    return C_MENU
-
-# ══════════════════════════════════════════════════════════════════════════
-# AI COACHING (free-text messages)
-# ══════════════════════════════════════════════════════════════════════════
-
-async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_user or not update.message.text:
-        return
-    text = update.message.text
-    uid = update.effective_user.id
-    user = store(ctx).load(uid)
-    if not user:
-        await update.message.reply_text("Starte zuerst mit /start.")
-        return
-
-    # Intent detection
-    intent = detect_intent(text)
-    if intent:
-        await update.message.reply_text(f"Intent: {intent}")
-        return
-
-    # AI response
-    try:
-        resp = await ai(ctx).chat(text, user)
-        await update.message.reply_text(resp)
-        hist(ctx).add(uid, "user", text)
-        hist(ctx).add(uid, "assistant", resp)
-    except Exception as e:
-        log.error("AI error: %s", e)
-        await update.message.reply_text("AI Fehler. Versuchen Sie es später.")
-
-# ══════════════════════════════════════════════════════════════════════════
-# SAVINGS
-# ══════════════════════════════════════════════════════════════════════════
-
-async def savings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show savings or set goal."""
-    if not update.effective_user:
-        return
-    uid = update.effective_user.id
-    user = store(ctx).load(uid)
-    if not user:
-        await update.message.reply_text("Start with /start.")
-        return
-    if not user.daily_savings:
-        text = "Kein Sparziel gesetzt. Antworte: /savings 10 (für €10/Tag)"
-    else:
-        days = (date.today() - user.start_date).days if user.start_date else 0
-        total = user.daily_savings * days
-        text = f"💰 Gespart: €{total:.2f}\n📅 {days} Tage à €{user.daily_savings}"
-    await update.message.reply_text(text)
-
-async def on_savings_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Set daily savings amount."""
-    if not update.message or not update.message.text or not update.effective_user:
-        return
-    try:
-        text = update.message.text.strip()
-        parts = text.split()
-        amount = float(parts[-1])
-        uid = update.effective_user.id
-        user = store(ctx).load(uid)
-        if user:
-            user.daily_savings = amount
-            store(ctx).save(user)
-            await update.message.reply_text(f"✅ Sparziel: €{amount}/Tag gespeichert.")
-    except Exception:
-        await update.message.reply_text("Format: /savings 10")
-
-# ══════════════════════════════════════════════════════════════════════════
-# JOURNALING
-# ══════════════════════════════════════════════════════════════════════════
-
-async def journal(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Start journaling."""
+    # New user, start onboarding
     await update.message.reply_text(
-        "📝 Journal\n\n"
-        "Schreib einen Eintrag, oder:\n"
-        "/journal list — Alle Einträge\n"
-        "/journal 1 — Eintrag 1 lesen"
+        "Welcome to Unhooked! 🎯\n\nI'm here to support your digital wellness journey. "
+        "Let's get started. What's your name?"
+    )
+    return REGISTER
+
+
+async def register_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle name registration."""
+    user_id = update.effective_user.id
+    name = update.message.text.strip()
+
+    if not name or len(name) > 100:
+        await update.message.reply_text("Please enter a valid name (1-100 characters).")
+        return REGISTER
+
+    context.user_data["name"] = name
+    await update.message.reply_text(
+        f"Nice to meet you, {name}! 👋\n\n"
+        "What's the best emergency contact to reach you (name and phone number)? "
+        "This will only be used in crisis situations."
+    )
+    return EMERGENCY_CONTACT
+
+
+async def register_emergency_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle emergency contact registration."""
+    user_id = update.effective_user.id
+    contact = update.message.text.strip()
+
+    if not contact or len(contact) > 500:
+        await update.message.reply_text("Please enter a valid contact (1-500 characters).")
+        return EMERGENCY_CONTACT
+
+    name = context.user_data.get("name", "User")
+    store = Store(DATA_DIR)
+    state = UserState(
+        user_id=user_id,
+        name=name,
+        emergency_contact=contact,
+        streak_start_date=_today(),
+        last_check_in=_today(),
+        journal_entries=[],
+        total_saved_cents=0,
+    )
+    store.save_user(user_id, state)
+
+    await update.message.reply_text(
+        f"Great! I've saved your emergency contact. 📋\n\n"
+        "You're all set. Here's what I can help with:\n\n"
+        "• /status - Track your streak\n"
+        "• /sos - Crisis toolkit (grounding, breathing, urge surfing)\n"
+        "• /journal - Reflect and write\n"
+        "• /check - Daily mood check-in\n"
+        "• /savings - Celebrate money saved\n"
+        "• /reset - Start a new streak\n"
+        "• /help - See all commands\n\n"
+        "Let's go! 🚀"
+    )
+    return -1
+
+
+# ── Streak tracking ──────────────────────────────────────────────────────
+
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /status command to show streak and stats."""
+    if not await _check_whitelist(update, context):
+        return
+
+    user_id = update.effective_user.id
+    _log_command(user_id, "status")
+
+    store = Store(DATA_DIR)
+    state = store.get_user(user_id)
+
+    if not state:
+        await update.message.reply_text(
+            "You haven't registered yet. Use /start to begin."
+        )
+        return
+
+    today = _today()
+    streak_days = (today - state.streak_start_date).days
+
+    emoji_map = {1: "🔥", 7: "⭐", 14: "👑", 30: "🏆", 100: "💎"}
+    emoji = next((v for k, v in sorted(emoji_map.items()) if streak_days >= k), "💪")
+
+    msg = f"{emoji} Streak: {streak_days} days!\n\n" f"You're doing amazing!"
+    await update.message.reply_text(msg)
+
+
+async def reset_streak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /reset command to restart streak."""
+    if not await _check_whitelist(update, context):
+        return
+
+    user_id = update.effective_user.id
+    _log_command(user_id, "reset")
+
+    store = Store(DATA_DIR)
+    state = store.get_user(user_id)
+
+    if not state:
+        await update.message.reply_text(
+            "You haven't registered yet. Use /start to begin."
+        )
+        return
+
+    state.streak_start_date = _today()
+    store.save_user(user_id, state)
+
+    await update.message.reply_text(
+        "Your streak has been reset! 🆕\n\nLet's start fresh. You've got this! 💪"
     )
 
-async def on_journal_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Save journal entry."""
-    if not update.message or not update.message.text or not update.effective_user:
+
+async def undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /undo command to restore previous streak."""
+    if not await _check_whitelist(update, context):
         return
-    uid = update.effective_user.id
-    user = store(ctx).load(uid)
-    if not user:
+
+    user_id = update.effective_user.id
+    _log_command(user_id, "undo")
+
+    await update.message.reply_text(
+        "Undo is not yet implemented. You can use /reset to restart if needed."
+    )
+
+
+# ── Crisis toolkit ───────────────────────────────────────────────────────
+
+
+async def sos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /sos command (crisis toolkit)."""
+    if not await _check_whitelist(update, context):
         return
-    # Simple storage: append to list
-    if not user.journal_entries:
-        user.journal_entries = []
-    user.journal_entries.append({
-        "date": str(date.today()),
-        "text": update.message.text
-    })
-    store(ctx).save(user)
-    await update.message.reply_text(f"✅ Eintrag #{len(user.journal_entries)} gespeichert.")
 
-# ══════════════════════════════════════════════════════════════════════════
-# QUICK CHECK-IN (/check)
-# ══════════════════════════════════════════════════════════════════════════
+    user_id = update.effective_user.id
+    _log_command(user_id, "sos")
 
-async def check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Quick mood check-in."""
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("😊", callback_data="mood:great"),
-         InlineKeyboardButton("😐", callback_data="mood:ok"),
-         InlineKeyboardButton("😢", callback_data="mood:bad")],
-    ])
-    await update.message.reply_text("Wie geht es dir?", reply_markup=kb)
+    store = Store(DATA_DIR)
+    state = store.get_user(user_id)
 
-async def on_mood(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Save mood."""
-    q = update.callback_query
-    if not q or not q.data:
+    if not state:
+        await update.message.reply_text(
+            "You haven't registered yet. Use /start to begin."
+        )
         return
-    await q.answer()
-    mood = q.data.split(":")[1]
-    uid = update.effective_user.id if update.effective_user else 0
-    user = store(ctx).load(uid)
-    if user:
-        user.last_mood = mood
-        store(ctx).save(user)
-    await q.message.reply_text(f"✅ Mood gespeichert: {mood}")
 
-# ══════════════════════════════════════════════════════════════════════════
-# SCHEDULED MESSAGES (morning, nudge, evening)
-# ══════════════════════════════════════════════════════════════════════════
+    keyboard = [
+        [InlineKeyboardButton("Grounding 🌍", callback_data="grounding")],
+        [InlineKeyboardButton("Breathing 💨", callback_data="breathing")],
+        [InlineKeyboardButton("Urge Surfing 🏄", callback_data="urge_surfing")],
+        [InlineKeyboardButton("Call Emergency 📞", callback_data="call_emergency")],
+        [InlineKeyboardButton("Distraction 🎮", callback_data="distraction")],
+    ]
+    markup = InlineKeyboardMarkup(keyboard)
 
-async def _send_morning(app: Application, uid: int) -> None:
-    """Send morning briefing (scheduled)."""
+    await update.message.reply_text(
+        "Crisis Toolkit 🆘\n\nYou're not alone. Let's work through this together. "
+        "Choose a technique:",
+        reply_markup=markup,
+    )
+
+
+async def grounding_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send grounding technique (5-4-3-2-1)."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        text="5-4-3-2-1 Grounding Technique 🌍\n\n"
+        "Look around and name:\n"
+        "• 5 things you can SEE\n"
+        "• 4 things you can TOUCH\n"
+        "• 3 things you can HEAR\n"
+        "• 2 things you can SMELL\n"
+        "• 1 thing you can TASTE\n\n"
+        "Take your time. You're safe. 💚"
+    )
+
+
+async def breathing_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send non-blocking breathing exercise."""
+    query = update.callback_query
+    await query.answer()
+
+    steps = [
+        "🫁 Box Breathing Exercise\n\n1️⃣ Breathe in for 4 seconds",
+        "🫁 Box Breathing Exercise\n\n1️⃣ Breathe in for 4 seconds\n2️⃣ Hold for 4 seconds",
+        "🫁 Box Breathing Exercise\n\n1️⃣ Breathe in for 4 seconds\n2️⃣ Hold for 4 seconds\n3️⃣ Breathe out for 4 seconds",
+        "🫁 Box Breathing Exercise\n\n1️⃣ Breathe in for 4 seconds\n2️⃣ Hold for 4 seconds\n3️⃣ Breathe out for 4 seconds\n4️⃣ Hold for 4 seconds\n\nRepeat 4 times. You're doing great! 💚",
+    ]
+
+    await query.edit_message_text(text=steps[0])
+
+    # Schedule updates without blocking
+    for i in range(1, len(steps)):
+        await asyncio.sleep(4)
+        try:
+            await query.edit_message_text(text=steps[i])
+        except Exception:
+            pass
+
+
+async def urge_surfing_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send urge surfing technique."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        text="Urge Surfing 🏄\n\n"
+        "Urges are like waves. You can ride them without acting.\n\n"
+        "1. NOTICE: What are you feeling? Describe it.\n"
+        "2. BREATHE: Take slow, deep breaths.\n"
+        "3. NAME IT: 'This is a craving. It will pass.'\n"
+        "4. OBSERVE: Watch the urge peak, then fade.\n\n"
+        "Most urges last 10-20 minutes. You've got this! 💪"
+    )
+
+
+async def call_emergency_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send emergency contact info."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    store = Store(DATA_DIR)
+    state = store.get_user(user_id)
+
+    if not state or not state.emergency_contact:
+        await query.edit_message_text(
+            text="Emergency Contact\n\n"
+            "You haven't set an emergency contact yet. Use /start to add one."
+        )
+        return
+
+    await query.edit_message_text(
+        text=f"📞 Emergency Contact\n\n{state.emergency_contact}\n\n"
+        "Please reach out. Help is available. You're not alone. 💚"
+    )
+
+
+async def distraction_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send distraction activities."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        text="Distraction Activities 🎮\n\n"
+        "Try one of these:\n"
+        "• Go for a walk or run\n"
+        "• Listen to your favorite music\n"
+        "• Watch a funny video\n"
+        "• Call a friend\n"
+        "• Do a creative activity (draw, write, paint)\n"
+        "• Play a game\n"
+        "• Take a cold shower\n"
+        "• Journal your thoughts\n\n"
+        "Find something that engages you. You'll get through this! 💪"
+    )
+
+
+# ── Journaling ───────────────────────────────────────────────────────────
+
+
+async def journal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle /journal command."""
+    if not await _check_whitelist(update, context):
+        return -1
+
+    user_id = update.effective_user.id
+    _log_command(user_id, "journal")
+
+    store = Store(DATA_DIR)
+    state = store.get_user(user_id)
+
+    if not state:
+        await update.message.reply_text(
+            "You haven't registered yet. Use /start to begin."
+        )
+        return -1
+
+    prompts = [
+        "What's on your mind today?",
+        "How are you feeling right now?",
+        "What's one thing you're proud of today?",
+        "What's a challenge you faced and how did you handle it?",
+    ]
+    prompt = prompts[len(state.journal_entries) % len(prompts)]
+
+    await update.message.reply_text(f"📔 Journal\n\n{prompt}")
+    return JOURNAL
+
+
+async def journal_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle journal entry submission."""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    if not text or len(text) > 5000:
+        await update.message.reply_text(
+            "Please enter a journal entry (1-5000 characters)."
+        )
+        return JOURNAL
+
+    store = Store(DATA_DIR)
+    state = store.get_user(user_id)
+
+    if not state:
+        await update.message.reply_text("Something went wrong. Please try again.")
+        return -1
+
+    state.journal_entries.append({"date": _today().isoformat(), "text": text})
+    store.save_user(user_id, state)
+
+    await update.message.reply_text(
+        "Thank you for sharing. Your entry has been saved. 💚\n\n"
+        "Keep reflecting and growing!"
+    )
+    return -1
+
+
+# ── Savings tracking ────────────────────────────────────────────────────
+
+
+async def savings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /savings command to show progress."""
+    if not await _check_whitelist(update, context):
+        return
+
+    user_id = update.effective_user.id
+    _log_command(user_id, "savings")
+
+    store = Store(DATA_DIR)
+    state = store.get_user(user_id)
+
+    if not state:
+        await update.message.reply_text(
+            "You haven't registered yet. Use /start to begin."
+        )
+        return
+
+    amount = state.total_saved_cents / 100
+    msg = f"💰 Total Saved: ${amount:.2f}\n\nGreat work! Keep going! 🚀"
+    await update.message.reply_text(msg)
+
+
+# ── Mood check-in ──────────────────────────────────────────────────────
+
+
+async def check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /check command for mood check-in."""
+    if not await _check_whitelist(update, context):
+        return
+
+    user_id = update.effective_user.id
+    _log_command(user_id, "check")
+
+    store = Store(DATA_DIR)
+    state = store.get_user(user_id)
+
+    if not state:
+        await update.message.reply_text(
+            "You haven't registered yet. Use /start to begin."
+        )
+        return
+
+    state.last_check_in = _today()
+    store.save_user(user_id, state)
+
+    keyboard = [
+        [InlineKeyboardButton("😊 Great", callback_data="mood_great")],
+        [InlineKeyboardButton("😐 Okay", callback_data="mood_okay")],
+        [InlineKeyboardButton("😞 Not good", callback_data="mood_bad")],
+    ]
+    markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        "How are you feeling right now?", reply_markup=markup
+    )
+
+
+async def mood_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle mood selection."""
+    query = update.callback_query
+    await query.answer()
+
+    mood_map = {
+        "mood_great": ("😊 That's wonderful! Keep shining! ✨", "great"),
+        "mood_okay": ("😐 That's fair. One step at a time. 💪", "okay"),
+        "mood_bad": (
+            "😞 Tough day? Remember, this too shall pass. Reach out if you need support. 💚",
+            "bad",
+        ),
+    }
+
+    message, mood_key = mood_map.get(query.data, ("Thanks for sharing.", "unknown"))
+    await query.edit_message_text(text=message)
+
+
+# ── AI coaching ────────────────────────────────────────────────────────
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle free-text messages for AI coaching."""
+    if not await _check_whitelist(update, context):
+        return
+
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    if not text or len(text) > 5000:
+        return
+
+    store = Store(DATA_DIR)
+    state = store.get_user(user_id)
+
+    if not state:
+        await update.message.reply_text(
+            "You haven't registered yet. Use /start to begin."
+        )
+        return
+
+    # Show typing indicator
+    await update.message.chat.send_action("typing")
+
     try:
-        user = store(app.bot_data["store"]).load(uid)
-        if not user:
-            return
-        msg = f"🌅 Guten Morgen, {user.name}!\n\nStreik: {(date.today() - user.start_date).days if user.start_date else 0} Tage 🔥"
-        await app.bot.send_message(uid, msg)
-    except Exception as e:
-        log.error("Morning message error: %s", e)
+        client = AIClient(AI_PROVIDER, AI_MODEL, OPENAI_KEY, ANTHROPIC_KEY)
+        history = History(state.journal_entries)
+        intent = detect_intent(text)
 
-async def _send_nudge(app: Application, uid: int) -> None:
-    """Midday nudge (scheduled)."""
-    try:
-        msg = "💪 Wie geht's? Komm zur /check."
-        await app.bot.send_message(uid, msg)
+        response = await client.coach(text, intent, history)
+        await _send_markdown(update.message, response)
     except Exception as e:
-        log.error("Nudge error: %s", e)
+        log.error("AI coaching error: %s", e)
+        await update.message.reply_text(
+            "Sorry, I couldn't process your message. Please try again."
+        )
 
-async def _send_evening(app: Application, uid: int) -> None:
-    """Evening reflection (scheduled)."""
-    try:
-        msg = "🌙 Gute Nacht! Journaling: /journal oder weiter mit /sos?"
-        await app.bot.send_message(uid, msg)
-    except Exception as e:
-        log.error("Evening message error: %s", e)
 
-def _schedule_user_jobs(app: Application, user: UserState) -> None:
-    """Schedule daily jobs for user (morning, nudge, evening)."""
-    if not user:
+# ── Scheduled messages ────────────────────────────────────────────────
+
+
+async def schedule_messages(app: Application) -> None:
+    """Set up scheduled messages (morning, nudge, evening)."""
+    job_queue = app.job_queue
+
+    # Morning message at 8 AM
+    job_queue.run_daily(
+        send_morning_message,
+        time=time(8, 0),
+        tzinfo=_get_tz(),
+        name="morning_message",
+    )
+
+    # Nudge message at 12 PM
+    job_queue.run_daily(
+        send_nudge_message,
+        time=time(12, 0),
+        tzinfo=_get_tz(),
+        name="nudge_message",
+    )
+
+    # Evening message at 6 PM
+    job_queue.run_daily(
+        send_evening_message,
+        time=time(18, 0),
+        tzinfo=_get_tz(),
+        name="evening_message",
+    )
+
+
+async def send_morning_message(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send morning motivation."""
+    store = Store(DATA_DIR)
+    for user_id in store.list_users():
+        try:
+            await context.bot.send_message(
+                user_id,
+                "☀️ Good morning! You've got this. Start your day strong! 💪",
+            )
+        except Exception as e:
+            log.debug("Could not send morning message to %s: %s", user_id, e)
+
+
+async def send_nudge_message(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send midday nudge."""
+    store = Store(DATA_DIR)
+    for user_id in store.list_users():
+        try:
+            await context.bot.send_message(
+                user_id,
+                "🌤️ How's your day going? Check in with /check to see how you're feeling.",
+            )
+        except Exception as e:
+            log.debug("Could not send nudge to %s: %s", user_id, e)
+
+
+async def send_evening_message(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send evening reflection prompt."""
+    store = Store(DATA_DIR)
+    for user_id in store.list_users():
+        try:
+            await update_mission_status(context.bot, user_id, store)
+        except Exception as e:
+            log.debug("Could not send evening message to %s: %s", user_id, e)
+
+
+async def update_mission_status(
+    bot: Any, user_id: int, store: Store
+) -> None:  # type: ignore
+    """Update mission status in the evening."""
+    state = store.get_user(user_id)
+    if not state:
         return
-    jq = cast(JobQueue, app.job_queue)
-    tz = ZoneInfo(user.timezone or TIMEZONE)
-    wake = _parse_time(user.wake_time or "07:30")
 
-    # Morning
-    jq.run_daily(
-        lambda c: _send_morning(app, user.user_id),
-        time=time(wake.hour, wake.minute, tzinfo=tz),
-        name=f"morning_{user.user_id}",
-    )
-    # Nudge: wake + 6h
-    nudge_t = (datetime.combine(date.today(), wake) + timedelta(hours=6)).time()
-    jq.run_daily(
-        lambda c: _send_nudge(app, user.user_id),
-        time=time(nudge_t.hour, nudge_t.minute, tzinfo=tz),
-        name=f"nudge_{user.user_id}",
-    )
-    # Evening
-    jq.run_daily(
-        lambda c: _send_evening(app, user.user_id),
-        time=time(21, 0, tzinfo=tz),
-        name=f"evening_{user.user_id}",
+    today = _today()
+    streak_days = (today - state.streak_start_date).days
+
+    msg = (
+        f"🌙 Evening reflection\n\n"
+        f"Your streak: {streak_days} days 🔥\n"
+        f"Journal entries: {len(state.journal_entries)}\n\n"
+        f"Reflect on your day with /journal or just wind down. You did great! 💚"
     )
 
-HELP_TEXT = """
-/sos — Crisis Toolkit (grounding, breathing, urge surfing, call, distract)
-/status — Streak, Erspartes, Mood
-/savings [€] — Sparziel setzen
-/check — Quick Mood Check
-/journal — Tagebucheintrag
-/undo — Reset rückgängig
-/help — Dieser Text
-"""
+    try:
+        await bot.send_message(user_id, msg)
+    except Exception as e:
+        log.debug("Could not send evening message: %s", e)
 
-async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
-        await update.message.reply_text(HELP_TEXT)
 
-# ══════════════════════════════════════════════════════════════════════════
-# APP SETUP
-# ══════════════════════════════════════════════════════════════════════════
+# ── Help and other commands ───────────────────────────────────────────
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /help command."""
+    if not await _check_whitelist(update, context):
+        return
+
+    help_text = """🎯 Unhooked Lite Commands
+
+/start - Begin onboarding or see main menu
+/status - Check your current streak
+/reset - Restart your streak
+/undo - Undo a reset (coming soon)
+
+/sos - Crisis toolkit
+  • Grounding (5-4-3-2-1 technique)
+  • Breathing (box breathing)
+  • Urge surfing
+  • Emergency contact
+  • Distraction activities
+
+/journal - Write a journal entry
+/check - Quick mood check-in
+/savings - View total amount saved
+/help - Show this menu
+
+You're not alone. We're here to support you! 💚
+    """
+    await update.message.reply_text(help_text)
+
+
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle unknown commands."""
+    await update.message.reply_text(
+        "I didn't understand that command. Try /help to see what I can do!"
+    )
+
+
+# ── Bot setup ────────────────────────────────────────────────────────────
+
 
 async def post_init(app: Application) -> None:
-    await app.bot.set_my_commands([
-        BotCommand("sos", "Soforthilfe bei Craving"),
-        BotCommand("status", "Streak & Erspartes"),
-        BotCommand("savings", "Geld gespart"),
-        BotCommand("check", "Quick Check-in"),
-        BotCommand("undo", "Reset rückgängig"),
-        BotCommand("journal", "Tagebuch"),
-        BotCommand("help", "Alle Befehle"),
-    ])
-    s: Store = app.bot_data["store"]
-    users = await asyncio.to_thread(s.all_users)
-    for user in users:
-        _schedule_user_jobs(app, user)
+    """Initialize the bot after it starts."""
+    log.info("Bot is starting up...")
+    await schedule_messages(app)
+    log.info("Scheduled messages set up.")
+
 
 def main() -> None:
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is required")
+    """Start the bot."""
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.bot_data["store"] = Store(DATA_DIR)
-    app.bot_data["ai"] = AIClient(
-        provider=AI_PROVIDER, model=AI_MODEL,
-        openai_key=OPENAI_KEY, anthropic_key=ANTHROPIC_KEY,
-    )
-    app.bot_data["history"] = History()
-
-    # Security guard
-    app.add_handler(TypeHandler(Update, _guard), group=-1)
-
-    # Onboarding conversation
-    conv = ConversationHandler(
+    # Onboarding
+    conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            1: [MessageHandler(filters.TEXT, on_name)],
+            REGISTER: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_name)],
+            EMERGENCY_CONTACT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, register_emergency_contact)
+            ],
+            JOURNAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, journal_entry)],
         },
-        fallbacks=[],
+        fallbacks=[CommandHandler("start", start)],
     )
-    app.add_handler(conv)
+
+    app.add_handler(conv_handler)
 
     # Streak commands
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("reset", reset_streak))
-    app.add_handler(CommandHandler("undo", undo_reset))
+    app.add_handler(CommandHandler("undo", undo))
 
-    # Crisis toolkit /sos
-    sos_conv = ConversationHandler(
-        entry_points=[CommandHandler("sos", sos)],
-        states={
-            C_MENU: [CallbackQueryHandler(sos_menu)],
-            C_G1: [MessageHandler(filters.TEXT, g1)],
-            C_G2: [MessageHandler(filters.TEXT, g2)],
-            C_G3: [MessageHandler(filters.TEXT, g3)],
-            C_G4: [MessageHandler(filters.TEXT, g4)],
-            C_G5: [MessageHandler(filters.TEXT, g5)],
-            C_SURF1: [MessageHandler(filters.TEXT, s1)],
-            C_SURF2: [MessageHandler(filters.TEXT, s2)],
-            C_CONTACT: [MessageHandler(filters.TEXT, on_contact)],
-        },
-        fallbacks=[CommandHandler("sos", sos)],
+    # Crisis toolkit
+    app.add_handler(CommandHandler("sos", sos))
+    app.add_handler(
+        CallbackQueryHandler(grounding_handler, pattern="^grounding$")
     )
-    app.add_handler(sos_conv)
-
-    # Savings
-    app.add_handler(CommandHandler("savings", savings))
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^\d+"), on_savings_amount))
+    app.add_handler(
+        CallbackQueryHandler(breathing_handler, pattern="^breathing$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(urge_surfing_handler, pattern="^urge_surfing$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(call_emergency_handler, pattern="^call_emergency$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(distraction_handler, pattern="^distraction$")
+    )
 
     # Journaling
     app.add_handler(CommandHandler("journal", journal))
 
-    # Check-in / mood
+    # Savings
+    app.add_handler(CommandHandler("savings", savings))
+
+    # Mood check-in
     app.add_handler(CommandHandler("check", check))
-    app.add_handler(CallbackQueryHandler(on_mood, pattern=r"^mood:"))
+    app.add_handler(CallbackQueryHandler(mood_handler, pattern="^mood_"))
 
-    # Free-text AI coaching
-    app.add_handler(MessageHandler(filters.TEXT, on_text))
+    # AI coaching (free-text messages)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Help
-    app.add_handler(CommandHandler("help", help_cmd))
+    # Help and unknown
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
-    # Post-init setup (schedule jobs)
-    app.post_init = post_init
+    # Start the bot
+    log.info("Starting bot...")
+    app.run_polling()
 
-    log.info("Starting Unhooked Lite bot")
-    app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
     main()
