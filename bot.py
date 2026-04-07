@@ -120,7 +120,7 @@ S_HABIT, S_HABIT_TXT, S_LAST, S_WAKE, S_SAVINGS, S_TRIG, S_WHY = range(7)
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not update.message:
         return ConversationHandler.END
-    kb = [[InlineKeyboardButton(label, callback_data=f"h:{name or 'other'}") for label, name in HABITS]]
+    kb = [[InlineKeyboardButton(label, callback_data=f"h:{name or 'other'}")] for label, name in HABITS]
     await update.message.reply_text("Hey. Ich bin dein Unhooked Coach. Bereit, die Kontrolle zurückzuholen?")
     await update.message.reply_text("Was möchtest du verändern?", reply_markup=InlineKeyboardMarkup(kb))
     return S_HABIT
@@ -542,6 +542,8 @@ async def surf_r1(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ud = ctx.user_data or {}
     ud["surf_r1"] = r
     m = await q.message.reply_text(f"Intensität: {r}/10\n\n🌊 Beobachte die Welle... ⏳ 2 Min")
+    # The try/except around edit_text handles cases where the user
+    # cancelled or the message was deleted during the 2-min wait.
     for sec in [90, 60, 30, 0]:
         await asyncio.sleep(30)
         try:
@@ -618,17 +620,33 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     # AI coaching
     h = hist(ctx)
+    # Restore history from persistent storage on first access
+    if not h.recent(uid, 1) and user.chat_history:
+        for entry in user.chat_history:
+            h.add(uid, entry.get("role", "user"), entry.get("text", ""))
     history_text = h.format(uid, 6)
     h.add(uid, "user", text)
     reply = await ai(ctx).reply(user, text, history_text=history_text)
     h.add(uid, "coach", reply)
 
-    # Send (handle Telegram 4096 char limit)
+    # Send (handle Telegram 4096 char limit, split at newline boundaries)
     if len(reply) <= 4096:
         await update.message.reply_text(reply)
     else:
-        for i in range(0, len(reply), 4000):
-            await update.message.reply_text(reply[i:i+4000])
+        while reply:
+            if len(reply) <= 4000:
+                await update.message.reply_text(reply)
+                break
+            # Find nearest newline before the 4000-char limit
+            split_at = reply.rfind("\n", 0, 4000)
+            if split_at == -1:
+                split_at = 4000  # No newline found, hard split
+            await update.message.reply_text(reply[:split_at])
+            reply = reply[split_at:].lstrip("\n")
+
+    # Persist recent history to user data for restart resilience
+    user.chat_history = [{"role": t.role, "text": t.text} for t in h.recent(uid, 20)]
+    store(ctx).save(user)
 
 async def on_relapse_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
