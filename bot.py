@@ -173,7 +173,8 @@ async def on_wake(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     text = (update.message.text or "").strip()
     try:
-        datetime.strptime(text, "%H:%M")
+        h, m = text.split(":")
+        time(int(h), int(m))
     except ValueError:
         await update.message.reply_text("Bitte gib die Zeit im Format HH:MM an (z.B. 07:30).")
         return S_WAKE
@@ -395,9 +396,10 @@ async def cmd_journal(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("\n".join(lines))
         return ConversationHandler.END
     if args and args[0] == "read" and len(args) >= 2:
+        recent = user.journal[-10:]
         try:
             idx = int(args[1]) - 1
-            e = user.journal[idx]
+            e = recent[idx]
             await update.message.reply_text(f"#{idx+1} ({e['date'][:10]}):\n{e['text']}")
         except (IndexError, ValueError):
             await update.message.reply_text(f"Eintrag nicht gefunden. Du hast {len(user.journal)} Einträge.")
@@ -462,15 +464,16 @@ async def sos_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     action = q.data.split(":")[1]
     msg = q.message
 
+    # Cancel any running breathing task on any SOS interaction
+    ud = ctx.user_data
+    old_task = ud.get("breathing_task")
+    if old_task and not old_task.done():
+        old_task.cancel()
+
     if action == "ground":
         await msg.reply_text("🧘 Grounding (5-4-3-2-1)\n\nNenne mir 5 Dinge, die du gerade SIEHST:")
         return C_G1
     if action == "breathe":
-        # Cancel any existing breathing task before starting a new one
-        ud = ctx.user_data
-        old_task = ud.get("breathing_task")
-        if old_task and not old_task.done():
-            old_task.cancel()
         ud["breathing_task"] = asyncio.create_task(_run_breathing(msg))
         return C_MENU
     if action == "surf":
@@ -762,10 +765,19 @@ def _schedule_user_jobs(app: Application, user: UserState) -> None:
         for job in jq.get_jobs_by_name(name):
             job.schedule_removal()
 
-    jq.run_daily(lambda c: send_morning(app, uid), time=time(wake.hour, wake.minute, tzinfo=tz), name=f"m_{uid}")
+    async def _job_morning(_ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        await send_morning(app, uid)
+
+    async def _job_nudge(_ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        await send_nudge(app, uid)
+
+    async def _job_evening(_ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        await send_evening(app, uid)
+
+    jq.run_daily(_job_morning, time=time(wake.hour, wake.minute, tzinfo=tz), name=f"m_{uid}")
     nudge_dt = (datetime.combine(datetime.now(tz).date(), wake) + timedelta(hours=6)).time()
-    jq.run_daily(lambda c: send_nudge(app, uid), time=time(nudge_dt.hour, nudge_dt.minute, tzinfo=tz), name=f"n_{uid}")
-    jq.run_daily(lambda c: send_evening(app, uid), time=time(21, 0, tzinfo=tz), name=f"e_{uid}")
+    jq.run_daily(_job_nudge, time=time(nudge_dt.hour, nudge_dt.minute, tzinfo=tz), name=f"n_{uid}")
+    jq.run_daily(_job_evening, time=time(21, 0, tzinfo=tz), name=f"e_{uid}")
 
 # ══════════════════════════════════════════════════════════════════════════
 # HELP
