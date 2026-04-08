@@ -67,12 +67,13 @@ DATA_DIR = os.getenv("DATA_DIR", "./data")
 
 _raw_ids = os.getenv("ALLOWED_TELEGRAM_CHAT_IDS", "")
 ALLOWED_IDS: set[int] = set()
-for x in _raw_ids.split(","):
-    if x.strip():
-        try:
-            ALLOWED_IDS.add(int(x.strip()))
-        except ValueError:
-            log.error("Invalid ID in ALLOWED_TELEGRAM_CHAT_IDS: %s", x)
+if _raw_ids:
+    for x in _raw_ids.split(","):
+        if x.strip():
+            try:
+                ALLOWED_IDS.add(int(x.strip()))
+            except ValueError:
+                log.error("Invalid ID in ALLOWED_TELEGRAM_CHAT_IDS: %s", x)
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -139,7 +140,7 @@ async def on_habit(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     await q.answer()
     val = q.data.split(":", 1)[1]
-    ud = ctx.user_data or {}
+    ud = ctx.user_data
     if val == "other":
         await q.message.reply_text("Was möchtest du verändern? (Schreib es einfach)")
         return S_HABIT_TXT
@@ -151,7 +152,7 @@ async def on_habit(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def on_habit_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not update.message:
         return ConversationHandler.END
-    ud = ctx.user_data or {}
+    ud = ctx.user_data
     ud["habit"] = (update.message.text or "Other").strip()[:50]
     kb = [[InlineKeyboardButton(f"{k} ({d}d)", callback_data=f"l:{d}")] for k, d in LAST_USE]
     await update.message.reply_text("Wann war dein letzter Konsum?", reply_markup=InlineKeyboardMarkup(kb))
@@ -162,7 +163,7 @@ async def on_last_use(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not q or not q.data:
         return ConversationHandler.END
     await q.answer()
-    ud = ctx.user_data or {}
+    ud = ctx.user_data
     ud["quit_days"] = int(q.data.split(":")[1])
     await q.message.reply_text("Wann stehst du normalerweise auf? (HH:MM)")
     return S_WAKE
@@ -176,7 +177,7 @@ async def on_wake(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     except ValueError:
         await update.message.reply_text("Bitte gib die Zeit im Format HH:MM an (z.B. 07:30).")
         return S_WAKE
-    ud = ctx.user_data or {}
+    ud = ctx.user_data
     ud["wake"] = text
     await update.message.reply_text("Wie viel gibst du ungefähr pro Tag dafür aus? (z.B. 15)")
     return S_SAVINGS
@@ -184,7 +185,7 @@ async def on_wake(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def on_savings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not update.message:
         return ConversationHandler.END
-    ud = ctx.user_data or {}
+    ud = ctx.user_data
     try:
         ud["savings"] = max(0.0, round(float((update.message.text or "0").replace(",", ".")), 2))
     except ValueError:
@@ -205,7 +206,7 @@ async def on_trigger(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     await q.answer()
     val = q.data.split(":", 1)[1]
-    ud = ctx.user_data or {}
+    ud = ctx.user_data
     sel: list[str] = ud.setdefault("sel_trigs", [])
     if val == "DONE":
         await q.message.reply_text("Was ist dein WARUM? Wofür machst du das?")
@@ -220,7 +221,7 @@ async def on_trigger(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def on_why(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not update.message or not update.effective_user:
         return ConversationHandler.END
-    ud = ctx.user_data or {}
+    ud = ctx.user_data
     why = (update.message.text or "").strip()
     quit_days = ud.get("quit_days", 0)
     quit_date = datetime.now(ZoneInfo(TIMEZONE)).date() - timedelta(days=quit_days)
@@ -466,7 +467,7 @@ async def sos_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         return C_G1
     if action == "breathe":
         # Cancel any existing breathing task before starting a new one
-        ud = ctx.user_data or {}
+        ud = ctx.user_data
         old_task = ud.get("breathing_task")
         if old_task and not old_task.done():
             old_task.cancel()
@@ -483,7 +484,7 @@ async def sos_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             if user and user.emergency_contact:
                 contact = user.emergency_contact
         if not contact:
-            contact = (ctx.user_data or {}).get("emergency_contact")
+            contact = (ctx.user_data).get("emergency_contact")
         if contact:
             await msg.reply_text(f"Dein Notfallkontakt: {contact}\n\nRuf jetzt an.")
             await msg.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
@@ -549,7 +550,7 @@ async def g5(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def surf1(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not isinstance(update.effective_message, Message):
         return ConversationHandler.END
-    ud = ctx.user_data or {}
+    ud = ctx.user_data
     ud["surf_loc"] = update.effective_message.text
     await update.effective_message.reply_text(
         "Wie stark ist das Craving? (1-10)", reply_markup=_rating_kb("r1")
@@ -565,7 +566,7 @@ async def surf_r1(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         r = int(q.data.split("_")[1])
     except (IndexError, ValueError):
         return ConversationHandler.END
-    ud = ctx.user_data or {}
+    ud = ctx.user_data
     ud["surf_r1"] = r
     m = await q.message.reply_text(f"Intensität: {r}/10\n\n🌊 Beobachte die Welle... ⏳ 2 Min")
     # The try/except around edit_text handles cases where the user
@@ -588,7 +589,7 @@ async def surf_r2(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         r2 = int(q.data.split("_")[1])
     except (IndexError, ValueError):
         return ConversationHandler.END
-    r1 = (ctx.user_data or {}).get("surf_r1", r2)
+    r1 = (ctx.user_data).get("surf_r1", r2)
     diff = r1 - r2
     if diff > 0:
         txt = f"Vorher: {r1}/10 → Jetzt: {r2}/10\n\n📉 {diff} Punkte weniger. Die Welle geht vorbei."
@@ -607,7 +608,7 @@ async def on_contact(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not contact:
         await update.effective_message.reply_text("Bitte schick mir einen Namen oder Nummer:")
         return C_CONTACT
-    ud = ctx.user_data or {}
+    ud = ctx.user_data
     ud["emergency_contact"] = contact
     # Persist to UserState for restart resilience
     if update.effective_user:
