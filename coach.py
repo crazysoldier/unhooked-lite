@@ -7,6 +7,8 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
+import anthropic
+import openai
 from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
 
@@ -119,7 +121,7 @@ class AIClient:
             if self.provider == "anthropic":
                 return await self._anthropic(system, message)
             return await self._openai(system, message)
-        except Exception as exc:
+        except (openai.APIError, anthropic.APIError) as exc:
             logger.warning("AI call failed: %s", exc)
             return "Pause. Atme 4-4-8 — dann schreib mir, was als Nächstes kommt."
 
