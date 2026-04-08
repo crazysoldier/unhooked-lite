@@ -85,6 +85,9 @@ def ai(ctx: ContextTypes.DEFAULT_TYPE) -> AIClient:
 def hist(ctx: ContextTypes.DEFAULT_TYPE) -> History:
     return ctx.bot_data["history"]
 
+_TG_MSG_LIMIT = 4096  # Telegram max message length
+_TG_SPLIT_AT = 4000   # Split threshold (leave room for edge cases)
+
 def _parse_time(s: str) -> time:
     try:
         h, m = s.split(":")
@@ -125,7 +128,7 @@ S_HABIT, S_HABIT_TXT, S_LAST, S_WAKE, S_SAVINGS, S_TRIG, S_WHY = range(7)
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not update.message:
         return ConversationHandler.END
-    kb = [[InlineKeyboardButton(label, callback_data=f"h:{name or 'other'}")] for label, name in HABITS]
+    kb = [[InlineKeyboardButton(label, callback_data=f"h:{name or 'other'}") for label, name in HABITS]]
     await update.message.reply_text("Hey. Ich bin dein Unhooked Coach. Bereit, die Kontrolle zurückzuholen?")
     await update.message.reply_text("Was möchtest du verändern?", reply_markup=InlineKeyboardMarkup(kb))
     return S_HABIT
@@ -141,7 +144,7 @@ async def on_habit(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await q.message.reply_text("Was möchtest du verändern? (Schreib es einfach)")
         return S_HABIT_TXT
     ud["habit"] = val
-    kb = [[InlineKeyboardButton(f"{k} ({d}d)", callback_data=f"l:{d}")] for k, d in LAST_USE]
+    kb = [[InlineKeyboardButton(f"{k} ({d}d)", callback_data=f"l:{d}") for k, d in LAST_USE]]
     await q.message.reply_text("Wann war dein letzter Konsum?", reply_markup=InlineKeyboardMarkup(kb))
     return S_LAST
 
@@ -150,7 +153,7 @@ async def on_habit_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     ud = ctx.user_data or {}
     ud["habit"] = (update.message.text or "Other").strip()[:50]
-    kb = [[InlineKeyboardButton(f"{k} ({d}d)", callback_data=f"l:{d}")] for k, d in LAST_USE]
+    kb = [[InlineKeyboardButton(f"{k} ({d}d)", callback_data=f"l:{d}") for k, d in LAST_USE]]
     await update.message.reply_text("Wann war dein letzter Konsum?", reply_markup=InlineKeyboardMarkup(kb))
     return S_LAST
 
@@ -167,8 +170,14 @@ async def on_last_use(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def on_wake(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not update.message:
         return ConversationHandler.END
+    text = (update.message.text or "").strip()
+    try:
+        datetime.strptime(text, "%H:%M")
+    except ValueError:
+        await update.message.reply_text("Bitte gib die Zeit im Format HH:MM an (z.B. 07:30).")
+        return S_WAKE
     ud = ctx.user_data or {}
-    ud["wake"] = (update.message.text or "07:30").strip()
+    ud["wake"] = text
     await update.message.reply_text("Wie viel gibst du ungefähr pro Tag dafür aus? (z.B. 15)")
     return S_SAVINGS
 
@@ -186,7 +195,7 @@ async def on_savings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return S_TRIG
 
 def _trig_kb(sel: set[str]) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(("✅ " if t in sel else "") + t, callback_data=f"t:{t}")] for t in TRIGGERS]
+    rows = [[InlineKeyboardButton(("✅ " if t in sel else "") + t, callback_data=f"t:{t}") for t in TRIGGERS]]
     rows.append([InlineKeyboardButton("✔️ Fertig", callback_data="t:DONE")])
     return InlineKeyboardMarkup(rows)
 
@@ -456,8 +465,12 @@ async def sos_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await msg.reply_text("🧘 Grounding (5-4-3-2-1)\n\nNenne mir 5 Dinge, die du gerade SIEHST:")
         return C_G1
     if action == "breathe":
-        # Run breathing as background task so the user can switch tools or cancel
-        asyncio.create_task(_run_breathing(msg))
+        # Cancel any existing breathing task before starting a new one
+        ud = ctx.user_data or {}
+        old_task = ud.get("breathing_task")
+        if old_task and not old_task.done():
+            old_task.cancel()
+        ud["breathing_task"] = asyncio.create_task(_run_breathing(msg))
         return C_MENU
     if action == "surf":
         await msg.reply_text("🌊 Urge Surfing\n\nSchritt 1: Wo spürst du das Craving im Körper?\n(z.B. Brust, Magen, Hände)")
@@ -648,18 +661,17 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     reply = await ai(ctx).reply(user, text, history_text=history_text)
     h.add(uid, "coach", reply)
 
-    # Send (handle Telegram 4096 char limit, split at newline boundaries)
-    if len(reply) <= 4096:
+    # Send (handle Telegram message length limit, split at newline boundaries)
+    if len(reply) <= _TG_MSG_LIMIT:
         await update.message.reply_text(reply)
     else:
         while reply:
-            if len(reply) <= 4000:
+            if len(reply) <= _TG_SPLIT_AT:
                 await update.message.reply_text(reply)
                 break
-            # Find nearest newline before the 4000-char limit
-            split_at = reply.rfind("\n", 0, 4000)
+            split_at = reply.rfind("\n", 0, _TG_SPLIT_AT)
             if split_at == -1:
-                split_at = 4000  # No newline found, hard split
+                split_at = _TG_SPLIT_AT
             await update.message.reply_text(reply[:split_at])
             reply = reply[split_at:].lstrip("\n")
 
@@ -735,7 +747,11 @@ async def send_evening(app: Application, uid: int) -> None:
     ))
 
 def _schedule_user_jobs(app: Application, user: UserState) -> None:
-    tz = ZoneInfo(user.timezone or TIMEZONE)
+    try:
+        tz = ZoneInfo(user.timezone or TIMEZONE)
+    except Exception:
+        log.warning("Invalid timezone '%s' for user %d, falling back to %s", user.timezone, user.user_id, TIMEZONE)
+        tz = ZoneInfo(TIMEZONE)
     wake = _parse_time(user.wake_time)
     jq = cast(JobQueue, app.job_queue)
     uid = user.user_id
@@ -746,7 +762,7 @@ def _schedule_user_jobs(app: Application, user: UserState) -> None:
             job.schedule_removal()
 
     jq.run_daily(lambda c: send_morning(app, uid), time=time(wake.hour, wake.minute, tzinfo=tz), name=f"m_{uid}")
-    nudge_dt = (datetime.combine(datetime.now(ZoneInfo(user.timezone or TIMEZONE)).date(), wake) + timedelta(hours=6)).time()
+    nudge_dt = (datetime.combine(datetime.now(tz).date(), wake) + timedelta(hours=6)).time()
     jq.run_daily(lambda c: send_nudge(app, uid), time=time(nudge_dt.hour, nudge_dt.minute, tzinfo=tz), name=f"n_{uid}")
     jq.run_daily(lambda c: send_evening(app, uid), time=time(21, 0, tzinfo=tz), name=f"e_{uid}")
 
