@@ -45,7 +45,14 @@ class UserState:
 
     def _today(self) -> date:
         """Return today's date in the user's configured timezone."""
-        return datetime.now(ZoneInfo(self.timezone)).date()
+        try:
+            return datetime.now(ZoneInfo(self.timezone)).date()
+        except Exception:
+            logger.warning(
+                "Invalid timezone '%s' for user %d, falling back to UTC",
+                self.timezone, self.user_id,
+            )
+            return datetime.now(ZoneInfo("UTC")).date()
 
     def calc_streak(self, today: date | None = None) -> int:
         base = today or self._today()
