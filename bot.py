@@ -226,17 +226,30 @@ async def on_why(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     why = (update.message.text or "").strip()
     quit_days = ud.get("quit_days", 0)
     quit_date = datetime.now(ZoneInfo(TIMEZONE)).date() - timedelta(days=quit_days)
-    user = UserState(
-        user_id=update.effective_user.id,
-        username=update.effective_user.username or "",
-        habit=ud.get("habit", "Other"),
-        why=why,
-        quit_date=quit_date.isoformat(),
-        wake_time=ud.get("wake", "07:30"),
-        triggers=ud.get("sel_trigs", []),
-        timezone=TIMEZONE,
-        savings_per_day=ud.get("savings", 1.5),
-    )
+    # Preserve existing user data (journal, mood_log, chat_history, etc.)
+    existing = store(ctx).load(update.effective_user.id)
+    if existing:
+        existing.username = update.effective_user.username or ""
+        existing.habit = ud.get("habit", "Other")
+        existing.why = why
+        existing.quit_date = quit_date.isoformat()
+        existing.wake_time = ud.get("wake", "07:30")
+        existing.triggers = ud.get("sel_trigs", [])
+        existing.timezone = TIMEZONE
+        existing.savings_per_day = ud.get("savings", 1.5)
+        user = existing
+    else:
+        user = UserState(
+            user_id=update.effective_user.id,
+            username=update.effective_user.username or "",
+            habit=ud.get("habit", "Other"),
+            why=why,
+            quit_date=quit_date.isoformat(),
+            wake_time=ud.get("wake", "07:30"),
+            triggers=ud.get("sel_trigs", []),
+            timezone=TIMEZONE,
+            savings_per_day=ud.get("savings", 1.5),
+        )
     user.calc_streak()
     store(ctx).save(user)
     _schedule_user_jobs(ctx.application, user)
@@ -464,11 +477,12 @@ async def sos_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     action = q.data.split(":")[1]
     msg = q.message
 
-    # Cancel any running breathing task on any SOS interaction
+    # Cancel any running SOS tasks on menu interaction
     ud = ctx.user_data
-    old_task = ud.get("breathing_task")
-    if old_task and not old_task.done():
-        old_task.cancel()
+    for task_key in ("breathing_task", "surf_task"):
+        old_task = ud.get(task_key)
+        if old_task and not old_task.done():
+            old_task.cancel()
 
     if action == "ground":
         await msg.reply_text("🧘 Grounding (5-4-3-2-1)\n\nNenne mir 5 Dinge, die du gerade SIEHST:")
@@ -500,7 +514,12 @@ async def sos_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             range(12, 17): "💪 Workout | 🍳 Kochen | 🧹 Aufräumen",
             range(17, 22): "📖 Lesen | 🎧 Podcast | 🤸 Stretching",
         }
-        tz = ZoneInfo(TIMEZONE)
+        user_tz = TIMEZONE
+        if update.effective_user:
+            u = store(ctx).load(update.effective_user.id)
+            if u and u.timezone:
+                user_tz = u.timezone
+        tz = ZoneInfo(user_tz)
         h = datetime.now(tz).hour
         tip = next((v for r, v in tips.items() if h in r), "🫁 Atemübung | 🍵 Tee | 📝 Journaling")
         await msg.reply_text(tip)
@@ -560,6 +579,17 @@ async def surf1(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     )
     return C_SURF_R1
 
+async def _run_surf_timer(msg: Message, r: int) -> None:
+    """Background task for the 2-minute urge surfing timer."""
+    m = await msg.reply_text(f"Intensität: {r}/10\n\n🌊 Beobachte die Welle... ⏳ 2 Min")
+    for sec in [90, 60, 30, 0]:
+        await asyncio.sleep(30)
+        try:
+            await m.edit_text(f"🌊 Beobachte... ⏳ {sec}s" if sec else "🌊 Die 2 Minuten sind um.")
+        except Exception:
+            pass
+    await msg.reply_text("Wie stark ist das Craving JETZT?", reply_markup=_rating_kb("r2"))
+
 async def surf_r1(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     if not q or not q.data or not isinstance(q.message, Message):
@@ -571,16 +601,7 @@ async def surf_r1(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     ud = ctx.user_data
     ud["surf_r1"] = r
-    m = await q.message.reply_text(f"Intensität: {r}/10\n\n🌊 Beobachte die Welle... ⏳ 2 Min")
-    # The try/except around edit_text handles cases where the user
-    # cancelled or the message was deleted during the 2-min wait.
-    for sec in [90, 60, 30, 0]:
-        await asyncio.sleep(30)
-        try:
-            await m.edit_text(f"🌊 Beobachte... ⏳ {sec}s" if sec else "🌊 Die 2 Minuten sind um.")
-        except Exception:
-            pass
-    await q.message.reply_text("Wie stark ist das Craving JETZT?", reply_markup=_rating_kb("r2"))
+    ud["surf_task"] = asyncio.create_task(_run_surf_timer(q.message, r))
     return C_SURF_R2
 
 async def surf_r2(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
