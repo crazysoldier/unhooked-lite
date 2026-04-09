@@ -115,7 +115,7 @@ class Store:
             return None
         try:
             return UserState.from_dict(json.loads(p.read_text(encoding="utf-8")))
-        except (json.JSONDecodeError, TypeError) as exc:
+        except (json.JSONDecodeError, TypeError, AttributeError) as exc:
             logger.error("Corrupted data file %s: %s", p, exc)
             return None
 
@@ -130,6 +130,6 @@ class Store:
         for f in self.base.glob("*.json"):
             try:
                 users.append(UserState.from_dict(json.loads(f.read_text(encoding="utf-8"))))
-            except (json.JSONDecodeError, TypeError) as exc:
+            except (json.JSONDecodeError, TypeError, AttributeError) as exc:
                 logger.error("Skipping corrupted data file %s: %s", f, exc)
         return users
