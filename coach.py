@@ -159,18 +159,31 @@ class AIClient:
 # Word-boundary matching avoids false positives like "glückstrückfall" or
 # "geraucht" inside an unrelated compound. Multi-word phrases use \s+ so any
 # whitespace between tokens matches.
+#
+# Two groups:
+# - "ambiguous" patterns need a negation check on both sides (e.g. "rückfall"
+#   alone could be negated by "kein" before or "gab es keinen" after).
+# - "self_negated" patterns already include the negation as part of the signal
+#   (e.g. "nicht geschafft" = "didn't make it" = relapse); skip negation check.
 _RELAPSE_RE = re.compile(
     r"\b(?:"
     r"rückfall|relapse|geraucht|gekifft"
     r"|hab(?:e)?\s+wieder"
     r"|i\s+smoked|i\s+relapsed"
-    r"|geschafft\s+nicht"
     r")\b",
     re.IGNORECASE,
 )
 
-# If any of these appear in the 3 tokens immediately before the match,
-# treat it as negated ("keinen rückfall", "heute nicht geraucht", ...) and skip.
+# Phrases whose own negation IS the relapse signal — a plain `nicht` before
+# them would be double-negation, so we skip the negation lookaround entirely.
+_RELAPSE_SELF_NEGATED_RE = re.compile(
+    r"\bnicht\s+geschafft\b",
+    re.IGNORECASE,
+)
+
+# If any of these appear in the 3 tokens immediately before OR after the match,
+# treat it as negated ("keinen rückfall", "heute nicht geraucht", "rückfall
+# gab es heute keinen", ...) and skip.
 _NEGATIONS = {
     # German
     "kein", "keine", "keinen", "keiner", "keinem", "keines",
@@ -187,16 +200,34 @@ _NEGATIONS = {
 _JOURNAL_PREFIX = ["journal:", "tagebuch:", "log:"]
 
 
+def _is_negated(lower: str, start: int, end: int) -> bool:
+    """True if a relapse keyword at [start:end] is negated by nearby context.
+
+    Pre-match: checks 3 tokens (German negation usually sits directly in
+    front: "kein rückfall", "nicht geraucht").
+    Post-match: checks 5 tokens — German 'es gibt' constructions place the
+    negation further away ("Rückfall gab es heute keinen") and needing ~5
+    tokens to reach it is normal. A wider window risks false negatives but
+    a confirmation button (not an auto-reset) is the downstream consequence.
+    """
+    before = lower[:start].split()[-3:]
+    after = lower[end:].split()[:5]
+    for tok in (*before, *after):
+        if tok.strip(".,!?;:") in _NEGATIONS:
+            return True
+    return False
+
+
 def detect_intent(text: str) -> tuple[str, str] | None:
     lower = text.lower().strip()
     for prefix in _JOURNAL_PREFIX:
         if lower.startswith(prefix):
             return ("journal", text[len(prefix):].strip())
+    # Self-negated patterns: the negation is part of the phrase itself, so
+    # the standard negation check would mis-flag them as denied. Match first.
+    if _RELAPSE_SELF_NEGATED_RE.search(lower):
+        return ("relapse", text)
     match = _RELAPSE_RE.search(lower)
-    if match:
-        # Peek at the 3 tokens before the relapse keyword for a negation.
-        preceding = lower[: match.start()].split()[-3:]
-        if any(tok.strip(".,!?;:") in _NEGATIONS for tok in preceding):
-            return None
+    if match and not _is_negated(lower, match.start(), match.end()):
         return ("relapse", text)
     return None

@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import weakref
 from datetime import date, datetime, time, timedelta
 from typing import cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -99,11 +100,24 @@ def _user_lock(ctx: ContextTypes.DEFAULT_TYPE, uid: int) -> asyncio.Lock:
 
     Created lazily; reused per uid. on_text uses `lock.locked()` as a soft
     spam check before entering, so a user spamming free-text doesn't queue
-    parallel API calls."""
-    locks: dict[int, asyncio.Lock] = ctx.bot_data.setdefault("_user_locks", {})
+    parallel API calls.
+
+    Stored in a WeakValueDictionary so locks for inactive users are garbage-
+    collected once no handler / waiter holds a strong reference. This keeps
+    memory bounded as the user base grows without an explicit TTL sweep.
+    Safe because:
+    - The caller holds a strong reference via `async with _user_lock(...)`.
+    - Any coroutines blocked in `acquire()` also hold a strong reference.
+    - There is no `await` between `get` and the assignment below, so another
+      coroutine cannot observe a half-built entry.
+    """
+    locks: weakref.WeakValueDictionary[int, asyncio.Lock] = ctx.bot_data.setdefault(
+        "_user_locks", weakref.WeakValueDictionary()
+    )
     lock = locks.get(uid)
     if lock is None:
-        lock = locks[uid] = asyncio.Lock()
+        lock = asyncio.Lock()
+        locks[uid] = lock
     return lock
 
 
@@ -290,7 +304,7 @@ async def on_why(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             )
         user.calc_streak()
         await store(ctx).asave(user)
-    _schedule_user_jobs(ctx.application, user)
+    _schedule_user_jobs(ctx.application, user.user_id, user.timezone, user.wake_time)
     await update.message.reply_text(
         f"Alles klar. Tag {user.streak_days} startet jetzt.\n\n"
         f"Dein WARUM: {why}\n\n"
@@ -892,15 +906,14 @@ async def send_evening(app: Application, uid: int) -> None:
         f"Gewohnheit: {user.habit}. Tagesrückblick, Anerkennung. 2-3 Sätze Deutsch."
     ))
 
-def _schedule_user_jobs(app: Application, user: UserState) -> None:
+def _schedule_user_jobs(app: Application, uid: int, timezone: str, wake_time: str) -> None:
     try:
-        tz = ZoneInfo(user.timezone or TIMEZONE)
+        tz = ZoneInfo(timezone or TIMEZONE)
     except (ZoneInfoNotFoundError, ValueError, TypeError):
-        log.warning("Invalid timezone '%s' for user %d, falling back to %s", user.timezone, user.user_id, TIMEZONE)
+        log.warning("Invalid timezone '%s' for user %d, falling back to %s", timezone, uid, TIMEZONE)
         tz = ZoneInfo(TIMEZONE)
-    wake = _parse_time(user.wake_time)
+    wake = _parse_time(wake_time)
     jq = cast(JobQueue, app.job_queue)
-    uid = user.user_id
 
     # Remove old jobs for this user
     for name in [f"m_{uid}", f"n_{uid}", f"e_{uid}"]:
@@ -966,9 +979,10 @@ async def post_init(app: Application) -> None:
         BotCommand("help", "Alle Befehle"),
     ])
     s: Store = app.bot_data["store"]
-    users = await s.aall_users()
-    for user in users:
-        _schedule_user_jobs(app, user)
+    # Only load the 3 scheduling fields per user — avoids materializing full
+    # UserState (journal, chat_history, ...) just to register cron jobs.
+    for uid, tz_name, wake in await s.aall_schedules():
+        _schedule_user_jobs(app, uid, tz_name, wake)
 
 def main() -> None:
     if not BOT_TOKEN:

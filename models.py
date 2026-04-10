@@ -155,6 +155,30 @@ class Store:
                 logger.error("Skipping corrupted data file %s: %s", f, exc)
         return users
 
+    def all_schedules(self) -> list[tuple[int, str, str]]:
+        """Return only the fields needed for job scheduling — (uid, tz, wake).
+
+        Used by bot startup to register JobQueue entries without materializing
+        every UserState (journal, chat_history, mood_log, ...). Keeps startup
+        cheap as the user base grows.
+        """
+        out: list[tuple[int, str, str]] = []
+        for f in self.base.glob("*.json"):
+            if f.name.endswith(".tmp"):
+                continue
+            try:
+                d = json.loads(f.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.error("Skipping corrupted data file %s: %s", f, exc)
+                continue
+            uid = d.get("user_id")
+            if not isinstance(uid, int):
+                continue
+            tz = d.get("timezone") or "Europe/Vienna"
+            wake = d.get("wake_time") or "07:30"
+            out.append((uid, str(tz), str(wake)))
+        return out
+
     # --- Async wrappers ------------------------------------------------------
     # The bot runs on an asyncio event loop; file I/O is blocking. Dispatch
     # to a worker thread so we don't stall the loop under concurrent traffic.
@@ -167,3 +191,6 @@ class Store:
 
     async def aall_users(self) -> list[UserState]:
         return await asyncio.to_thread(self.all_users)
+
+    async def aall_schedules(self) -> list[tuple[int, str, str]]:
+        return await asyncio.to_thread(self.all_schedules)
