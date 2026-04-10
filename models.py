@@ -7,7 +7,7 @@ import logging
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +18,11 @@ class UserState:
     username: str = ""
     habit: str = ""
     why: str = ""
-    quit_date: str = field(default_factory=lambda: datetime.now(ZoneInfo("UTC")).date().isoformat())
+    # Placeholder only — onboarding always overrides this with a date computed
+    # in the user's timezone. Uses the host's local date to stay consistent
+    # with wall-clock time when a UserState is constructed without an explicit
+    # quit_date (e.g. tests).
+    quit_date: str = field(default_factory=lambda: date.today().isoformat())
     wake_time: str = "07:30"
     timezone: str = "Europe/Vienna"
     triggers: list[str] = field(default_factory=list)
@@ -47,7 +51,7 @@ class UserState:
         """Return today's date in the user's configured timezone."""
         try:
             return datetime.now(ZoneInfo(self.timezone)).date()
-        except Exception:
+        except (ZoneInfoNotFoundError, ValueError, TypeError):
             logger.warning(
                 "Invalid timezone '%s' for user %d, falling back to UTC",
                 self.timezone, self.user_id,

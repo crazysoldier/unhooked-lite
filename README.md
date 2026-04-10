@@ -46,7 +46,8 @@ Optional:
 **Option A: Docker**
 ```bash
 docker build -t unhooked-lite .
-docker run -e BOT_TOKEN=<your_token> -e OPENAI_API_KEY=<key> unhooked-lite
+# Provide one of OPENAI_API_KEY or ANTHROPIC_API_KEY (matching AI_PROVIDER).
+docker run --env-file .env -v "$(pwd)/data:/app/data" unhooked-lite
 ```
 
 **Option B: Local Python**

@@ -20,7 +20,7 @@ import logging
 import os
 from datetime import date, datetime, time, timedelta
 from typing import cast
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dotenv import load_dotenv
 
 from telegram import (
@@ -30,6 +30,7 @@ from telegram import (
     Message,
     Update,
 )
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -60,7 +61,7 @@ ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Vienna")
 try:
     ZoneInfo(TIMEZONE)
-except Exception:
+except (ZoneInfoNotFoundError, ValueError, TypeError):
     log.error("Invalid TIMEZONE: %s. Falling back to Europe/Vienna.", TIMEZONE)
     TIMEZONE = "Europe/Vienna"
 DATA_DIR = os.getenv("DATA_DIR", "./data")
@@ -89,11 +90,18 @@ def hist(ctx: ContextTypes.DEFAULT_TYPE) -> History:
 _TG_MSG_LIMIT = 4096  # Telegram max message length
 _TG_SPLIT_AT = 4000   # Split threshold (leave room for edge cases)
 
+def _user_now(user: UserState) -> datetime:
+    """Timezone-aware 'now' for the user (falls back to global TIMEZONE)."""
+    try:
+        return datetime.now(ZoneInfo(user.timezone or TIMEZONE))
+    except (ZoneInfoNotFoundError, ValueError, TypeError):
+        return datetime.now(ZoneInfo(TIMEZONE))
+
 def _parse_time(s: str) -> time:
     try:
         h, m = s.split(":")
         return time(int(h), int(m))
-    except Exception:
+    except ValueError:
         return time(7, 30)
 
 # ── Security ──────────────────────────────────────────────────────────────
@@ -225,9 +233,15 @@ async def on_why(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ud = ctx.user_data
     why = (update.message.text or "").strip()
     quit_days = ud.get("quit_days", 0)
-    quit_date = datetime.now(ZoneInfo(TIMEZONE)).date() - timedelta(days=quit_days)
     # Preserve existing user data (journal, mood_log, chat_history, etc.)
     existing = store(ctx).load(update.effective_user.id)
+    # Use the user's own timezone when re-onboarding; fall back to global.
+    user_tz_name = existing.timezone if existing and existing.timezone else TIMEZONE
+    try:
+        user_tz = ZoneInfo(user_tz_name)
+    except (ZoneInfoNotFoundError, ValueError, TypeError):
+        user_tz = ZoneInfo(TIMEZONE)
+    quit_date = datetime.now(user_tz).date() - timedelta(days=quit_days)
     if existing:
         existing.username = update.effective_user.username or ""
         existing.habit = ud.get("habit", "Other")
@@ -377,7 +391,7 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     mood = vals[0] if vals else 5
     craving = vals[1] if len(vals) > 1 else None
     stress = vals[2] if len(vals) > 2 else None
-    entry = {"date": datetime.now(ZoneInfo("UTC")).isoformat(), "morning": mood, "craving": craving, "stress": stress}
+    entry = {"date": _user_now(user).isoformat(), "morning": mood, "craving": craving, "stress": stress}
     user.mood_log.append(entry)
     store(ctx).save(user)
     parts = [f"Stimmung: {mood}/10"]
@@ -430,7 +444,7 @@ async def on_journal_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
     if not text:
         await update.message.reply_text("Schreib einfach deinen Gedanken — oder /cancel.")
         return J_WRITE
-    user.journal.append({"date": datetime.now(ZoneInfo("UTC")).isoformat(), "text": text})
+    user.journal.append({"date": _user_now(user).isoformat(), "text": text})
     store(ctx).save(user)
     await update.message.reply_text("Gespeichert. Starker Move — Bewusstsein schlägt Autopilot. 📝")
     return ConversationHandler.END
@@ -514,13 +528,8 @@ async def sos_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             range(12, 17): "💪 Workout | 🍳 Kochen | 🧹 Aufräumen",
             range(17, 22): "📖 Lesen | 🎧 Podcast | 🤸 Stretching",
         }
-        user_tz = TIMEZONE
-        if update.effective_user:
-            u = store(ctx).load(update.effective_user.id)
-            if u and u.timezone:
-                user_tz = u.timezone
-        tz = ZoneInfo(user_tz)
-        h = datetime.now(tz).hour
+        u = store(ctx).load(update.effective_user.id) if update.effective_user else None
+        h = (_user_now(u) if u else datetime.now(ZoneInfo(TIMEZONE))).hour
         tip = next((v for r, v in tips.items() if h in r), "🫁 Atemübung | 🍵 Tee | 📝 Journaling")
         await msg.reply_text(tip)
         await msg.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
@@ -544,16 +553,16 @@ async def _run_breathing(msg: Message) -> None:
             await asyncio.sleep(2)
             await m.edit_text(f"Runde {i}/5\n\n💨 Ausatmen... 6s")
             await asyncio.sleep(6)
-        except Exception:
+        except TelegramError:
             break
     try:
         await m.edit_text("✅ 5 Runden geschafft. Spür nach, wie sich dein Körper anfühlt.")
-    except Exception:
+    except TelegramError:
         pass
     await msg.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
 
 # Grounding steps
-async def _g_step(update, next_s, prompt):
+async def _g_step(update: Update, next_s: int, prompt: str) -> int:
     if isinstance(update.effective_message, Message):
         await update.effective_message.reply_text(prompt)
     return next_s
@@ -572,11 +581,13 @@ async def g5(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def surf1(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not isinstance(update.effective_message, Message):
         return ConversationHandler.END
-    ud = ctx.user_data
-    ud["surf_loc"] = update.effective_message.text
-    await update.effective_message.reply_text(
-        "Wie stark ist das Craving? (1-10)", reply_markup=_rating_kb("r1")
+    loc = (update.effective_message.text or "").strip()[:60]
+    ctx.user_data["surf_loc"] = loc
+    prompt = (
+        f"Bleib mit der Aufmerksamkeit bei {loc}. Wie stark ist das Craving? (1-10)"
+        if loc else "Wie stark ist das Craving? (1-10)"
     )
+    await update.effective_message.reply_text(prompt, reply_markup=_rating_kb("r1"))
     return C_SURF_R1
 
 async def _run_surf_timer(msg: Message, r: int) -> None:
@@ -586,7 +597,7 @@ async def _run_surf_timer(msg: Message, r: int) -> None:
         await asyncio.sleep(30)
         try:
             await m.edit_text(f"🌊 Beobachte... ⏳ {sec}s" if sec else "🌊 Die 2 Minuten sind um.")
-        except Exception:
+        except TelegramError:
             pass
     await msg.reply_text("Wie stark ist das Craving JETZT?", reply_markup=_rating_kb("r2"))
 
@@ -670,7 +681,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("Hast du wirklich konsumiert?", reply_markup=kb)
             return
         if kind == "journal":
-            user.journal.append({"date": datetime.now(ZoneInfo("UTC")).isoformat(), "text": data})
+            user.journal.append({"date": _user_now(user).isoformat(), "text": data})
             store(ctx).save(user)
             await update.message.reply_text("Gespeichert. 📝")
             return
@@ -734,7 +745,7 @@ async def _proactive(app: Application, uid: int, prompt: str) -> None:
     try:
         reply = await client.reply(user, prompt)
         await app.bot.send_message(chat_id=uid, text=reply)
-    except Exception as exc:
+    except TelegramError as exc:
         log.error("Proactive msg failed for %d: %s", uid, exc)
 
 async def send_morning(app: Application, uid: int) -> None:
@@ -774,7 +785,7 @@ async def send_evening(app: Application, uid: int) -> None:
 def _schedule_user_jobs(app: Application, user: UserState) -> None:
     try:
         tz = ZoneInfo(user.timezone or TIMEZONE)
-    except Exception:
+    except (ZoneInfoNotFoundError, ValueError, TypeError):
         log.warning("Invalid timezone '%s' for user %d, falling back to %s", user.timezone, user.user_id, TIMEZONE)
         tz = ZoneInfo(TIMEZONE)
     wake = _parse_time(user.wake_time)
@@ -796,8 +807,13 @@ def _schedule_user_jobs(app: Application, user: UserState) -> None:
         await send_evening(app, uid)
 
     jq.run_daily(_job_morning, time=time(wake.hour, wake.minute, tzinfo=tz), name=f"m_{uid}")
-    nudge_dt = (datetime.combine(datetime.now(tz).date(), wake) + timedelta(hours=6)).time()
-    jq.run_daily(_job_nudge, time=time(nudge_dt.hour, nudge_dt.minute, tzinfo=tz), name=f"n_{uid}")
+    # Nudge = 6h after wake, clamped to [wake+6h, 21:00] without day-wraparound.
+    nudge_hour = wake.hour + 6
+    if nudge_hour >= 21:
+        nudge_h, nudge_m = 14, 0  # fall back to early afternoon for late risers
+    else:
+        nudge_h, nudge_m = nudge_hour, wake.minute
+    jq.run_daily(_job_nudge, time=time(nudge_h, nudge_m, tzinfo=tz), name=f"n_{uid}")
     jq.run_daily(_job_evening, time=time(21, 0, tzinfo=tz), name=f"e_{uid}")
 
 # ══════════════════════════════════════════════════════════════════════════
