@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
+import threading
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -125,15 +128,42 @@ class Store:
 
     def save(self, user: UserState) -> None:
         path = self._path(user.user_id)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(user.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(path)
+        # Unique tmp name so two concurrent saves (e.g. JobQueue + user handler)
+        # don't clobber each other's in-progress writes before the atomic rename.
+        # Use with_name (not with_suffix) so Python 3.12.2+ doesn't reject the
+        # embedded dots.
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            tmp.write_text(json.dumps(user.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        except Exception:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
 
     def all_users(self) -> list[UserState]:
         users: list[UserState] = []
         for f in self.base.glob("*.json"):
+            # Skip half-written tmp files ("123.json.<pid>.<tid>.tmp")
+            if f.name.endswith(".tmp"):
+                continue
             try:
                 users.append(UserState.from_dict(json.loads(f.read_text(encoding="utf-8"))))
             except (json.JSONDecodeError, TypeError, AttributeError) as exc:
                 logger.error("Skipping corrupted data file %s: %s", f, exc)
         return users
+
+    # --- Async wrappers ------------------------------------------------------
+    # The bot runs on an asyncio event loop; file I/O is blocking. Dispatch
+    # to a worker thread so we don't stall the loop under concurrent traffic.
+
+    async def aload(self, uid: int) -> UserState | None:
+        return await asyncio.to_thread(self.load, uid)
+
+    async def asave(self, user: UserState) -> None:
+        await asyncio.to_thread(self.save, user)
+
+    async def aall_users(self) -> list[UserState]:
+        return await asyncio.to_thread(self.all_users)

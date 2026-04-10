@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import NamedTuple
@@ -155,19 +156,47 @@ class AIClient:
 # Intent detection (replaces handlers/intents.py — simple keyword match)
 # ---------------------------------------------------------------------------
 
-_RELAPSE_PHRASES = [
-    "rückfall", "relapse", "geraucht", "gekifft", "geschafft nicht",
-    "hab wieder", "habe wieder", "i smoked", "i relapsed",
-]
+# Word-boundary matching avoids false positives like "glückstrückfall" or
+# "geraucht" inside an unrelated compound. Multi-word phrases use \s+ so any
+# whitespace between tokens matches.
+_RELAPSE_RE = re.compile(
+    r"\b(?:"
+    r"rückfall|relapse|geraucht|gekifft"
+    r"|hab(?:e)?\s+wieder"
+    r"|i\s+smoked|i\s+relapsed"
+    r"|geschafft\s+nicht"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# If any of these appear in the 3 tokens immediately before the match,
+# treat it as negated ("keinen rückfall", "heute nicht geraucht", ...) and skip.
+_NEGATIONS = {
+    # German
+    "kein", "keine", "keinen", "keiner", "keinem", "keines",
+    "nichts", "nie", "niemals", "nicht", "niemand",
+    # English (with and without apostrophes — apostrophes get stripped
+    # from tokens via `strip(".,!?;:")` so we match both forms anyway,
+    # but listing both is explicit and safe)
+    "no", "not", "never",
+    "dont", "don't", "doesnt", "doesn't",
+    "didnt", "didn't", "havent", "haven't", "hasnt", "hasn't",
+    "wont", "won't",
+}
 
 _JOURNAL_PREFIX = ["journal:", "tagebuch:", "log:"]
 
 
 def detect_intent(text: str) -> tuple[str, str] | None:
     lower = text.lower().strip()
-    if any(p in lower for p in _RELAPSE_PHRASES):
-        return ("relapse", text)
     for prefix in _JOURNAL_PREFIX:
         if lower.startswith(prefix):
             return ("journal", text[len(prefix):].strip())
+    match = _RELAPSE_RE.search(lower)
+    if match:
+        # Peek at the 3 tokens before the relapse keyword for a negation.
+        preceding = lower[: match.start()].split()[-3:]
+        if any(tok.strip(".,!?;:") in _NEGATIONS for tok in preceding):
+            return None
+        return ("relapse", text)
     return None

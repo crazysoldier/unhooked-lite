@@ -1,0 +1,21 @@
+# Secrets — never copy into the image
+.env
+.env.*
+!.env.example
+
+# Per-user state — lives in a mounted volume at runtime
+data/
+
+# VCS / editor / build artifacts
+.git/
+.gitignore
+.github/
+.claude/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
