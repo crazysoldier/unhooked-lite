@@ -240,6 +240,7 @@ async def on_why(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         user_tz = ZoneInfo(user_tz_name)
     except (ZoneInfoNotFoundError, ValueError, TypeError):
+        user_tz_name = TIMEZONE
         user_tz = ZoneInfo(TIMEZONE)
     quit_date = datetime.now(user_tz).date() - timedelta(days=quit_days)
     if existing:
@@ -249,7 +250,7 @@ async def on_why(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         existing.quit_date = quit_date.isoformat()
         existing.wake_time = ud.get("wake", "07:30")
         existing.triggers = ud.get("sel_trigs", [])
-        existing.timezone = TIMEZONE
+        existing.timezone = user_tz_name
         existing.savings_per_day = ud.get("savings", 1.5)
         user = existing
     else:
@@ -261,7 +262,7 @@ async def on_why(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             quit_date=quit_date.isoformat(),
             wake_time=ud.get("wake", "07:30"),
             triggers=ud.get("sel_trigs", []),
-            timezone=TIMEZONE,
+            timezone=user_tz_name,
             savings_per_day=ud.get("savings", 1.5),
         )
     user.calc_streak()
@@ -476,9 +477,18 @@ def _rating_kb(prefix: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(str(n), callback_data=f"sos:{prefix}_{n}") for n in range(6, 11)],
     ])
 
+def _cancel_sos_tasks(ud: dict) -> None:
+    """Cancel any running breathing/surf background tasks."""
+    for key in ("breathing_task", "surf_task"):
+        task = ud.get(key)
+        if task and not task.done():
+            task.cancel()
+
 async def cmd_sos(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not update.message:
         return ConversationHandler.END
+    # Cancel any running SOS tasks from a previous /sos invocation
+    _cancel_sos_tasks(ctx.user_data)
     await update.message.reply_text("Ich bin da. Cravings gehen vorbei — lass uns das zusammen durchstehen.")
     await update.message.reply_text("Wähle ein Werkzeug:", reply_markup=_sos_kb())
     return C_MENU
@@ -493,10 +503,7 @@ async def sos_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
     # Cancel any running SOS tasks on menu interaction
     ud = ctx.user_data
-    for task_key in ("breathing_task", "surf_task"):
-        old_task = ud.get(task_key)
-        if old_task and not old_task.done():
-            old_task.cancel()
+    _cancel_sos_tasks(ud)
 
     if action == "ground":
         await msg.reply_text("🧘 Grounding (5-4-3-2-1)\n\nNenne mir 5 Dinge, die du gerade SIEHST:")
