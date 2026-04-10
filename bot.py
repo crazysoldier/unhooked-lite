@@ -89,7 +89,14 @@ def hist(ctx: ContextTypes.DEFAULT_TYPE) -> History:
     return ctx.bot_data["history"]
 
 
-def _user_lock(ctx: ContextTypes.DEFAULT_TYPE, uid: int) -> asyncio.Lock:
+# Module-level lock table — intentionally NOT stored in `ctx.bot_data` so
+# that a future `PicklePersistence` setup doesn't try (and fail) to pickle
+# these non-serializable objects. Locks are pure in-memory state tied to
+# the running event loop; they have no meaning across restarts.
+_user_locks: weakref.WeakValueDictionary[int, asyncio.Lock] = weakref.WeakValueDictionary()
+
+
+def _user_lock(_ctx: ContextTypes.DEFAULT_TYPE, uid: int) -> asyncio.Lock:
     """Per-user lock that serializes load-modify-save cycles on UserState.
 
     Required because async I/O (asave/aload via to_thread) yields the event
@@ -111,13 +118,10 @@ def _user_lock(ctx: ContextTypes.DEFAULT_TYPE, uid: int) -> asyncio.Lock:
     - There is no `await` between `get` and the assignment below, so another
       coroutine cannot observe a half-built entry.
     """
-    locks: weakref.WeakValueDictionary[int, asyncio.Lock] = ctx.bot_data.setdefault(
-        "_user_locks", weakref.WeakValueDictionary()
-    )
-    lock = locks.get(uid)
+    lock = _user_locks.get(uid)
     if lock is None:
         lock = asyncio.Lock()
-        locks[uid] = lock
+        _user_locks[uid] = lock
     return lock
 
 

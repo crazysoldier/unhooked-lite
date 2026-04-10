@@ -187,11 +187,11 @@ _RELAPSE_SELF_NEGATED_RE = re.compile(
 _NEGATIONS = {
     # German
     "kein", "keine", "keinen", "keiner", "keinem", "keines",
-    "nichts", "nie", "niemals", "nicht", "niemand",
+    "nichts", "nie", "niemals", "nicht", "niemand", "nein",
     # English (with and without apostrophes — apostrophes get stripped
     # from tokens via `strip(".,!?;:")` so we match both forms anyway,
     # but listing both is explicit and safe)
-    "no", "not", "never",
+    "no", "not", "never", "none",
     "dont", "don't", "doesnt", "doesn't",
     "didnt", "didn't", "havent", "haven't", "hasnt", "hasn't",
     "wont", "won't",
