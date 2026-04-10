@@ -87,6 +87,26 @@ def ai(ctx: ContextTypes.DEFAULT_TYPE) -> AIClient:
 def hist(ctx: ContextTypes.DEFAULT_TYPE) -> History:
     return ctx.bot_data["history"]
 
+
+def _user_lock(ctx: ContextTypes.DEFAULT_TYPE, uid: int) -> asyncio.Lock:
+    """Per-user lock that serializes load-modify-save cycles on UserState.
+
+    Required because async I/O (asave/aload via to_thread) yields the event
+    loop, so without explicit serialization a slow handler (e.g. on_text
+    awaiting an LLM call) can be interleaved with another handler — or a
+    JobQueue job — touching the same user file. The interleaved save would
+    clobber the slower handler's eventual write.
+
+    Created lazily; reused per uid. on_text uses `lock.locked()` as a soft
+    spam check before entering, so a user spamming free-text doesn't queue
+    parallel API calls."""
+    locks: dict[int, asyncio.Lock] = ctx.bot_data.setdefault("_user_locks", {})
+    lock = locks.get(uid)
+    if lock is None:
+        lock = locks[uid] = asyncio.Lock()
+    return lock
+
+
 _TG_MSG_LIMIT = 4096  # Telegram max message length
 _TG_SPLIT_AT = 4000   # Split threshold (leave room for edge cases)
 
@@ -234,40 +254,42 @@ async def on_why(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ud = ctx.user_data
     why = (update.message.text or "").strip()
     quit_days = ud.get("quit_days", 0)
-    # Preserve existing user data (journal, mood_log, chat_history, etc.)
-    existing = await store(ctx).aload(update.effective_user.id)
-    # Use the user's own timezone when re-onboarding; fall back to global.
-    user_tz_name = existing.timezone if existing and existing.timezone else TIMEZONE
-    try:
-        user_tz = ZoneInfo(user_tz_name)
-    except (ZoneInfoNotFoundError, ValueError, TypeError):
-        user_tz_name = TIMEZONE
-        user_tz = ZoneInfo(TIMEZONE)
-    quit_date = datetime.now(user_tz).date() - timedelta(days=quit_days)
-    if existing:
-        existing.username = update.effective_user.username or ""
-        existing.habit = ud.get("habit", "Other")
-        existing.why = why
-        existing.quit_date = quit_date.isoformat()
-        existing.wake_time = ud.get("wake", "07:30")
-        existing.triggers = ud.get("sel_trigs", [])
-        existing.timezone = user_tz_name
-        existing.savings_per_day = ud.get("savings", 1.5)
-        user = existing
-    else:
-        user = UserState(
-            user_id=update.effective_user.id,
-            username=update.effective_user.username or "",
-            habit=ud.get("habit", "Other"),
-            why=why,
-            quit_date=quit_date.isoformat(),
-            wake_time=ud.get("wake", "07:30"),
-            triggers=ud.get("sel_trigs", []),
-            timezone=user_tz_name,
-            savings_per_day=ud.get("savings", 1.5),
-        )
-    user.calc_streak()
-    await store(ctx).asave(user)
+    uid = update.effective_user.id
+    async with _user_lock(ctx, uid):
+        # Preserve existing user data (journal, mood_log, chat_history, etc.)
+        existing = await store(ctx).aload(uid)
+        # Use the user's own timezone when re-onboarding; fall back to global.
+        user_tz_name = existing.timezone if existing and existing.timezone else TIMEZONE
+        try:
+            user_tz = ZoneInfo(user_tz_name)
+        except (ZoneInfoNotFoundError, ValueError, TypeError):
+            user_tz_name = TIMEZONE
+            user_tz = ZoneInfo(TIMEZONE)
+        quit_date = datetime.now(user_tz).date() - timedelta(days=quit_days)
+        if existing:
+            existing.username = update.effective_user.username or ""
+            existing.habit = ud.get("habit", "Other")
+            existing.why = why
+            existing.quit_date = quit_date.isoformat()
+            existing.wake_time = ud.get("wake", "07:30")
+            existing.triggers = ud.get("sel_trigs", [])
+            existing.timezone = user_tz_name
+            existing.savings_per_day = ud.get("savings", 1.5)
+            user = existing
+        else:
+            user = UserState(
+                user_id=uid,
+                username=update.effective_user.username or "",
+                habit=ud.get("habit", "Other"),
+                why=why,
+                quit_date=quit_date.isoformat(),
+                wake_time=ud.get("wake", "07:30"),
+                triggers=ud.get("sel_trigs", []),
+                timezone=user_tz_name,
+                savings_per_day=ud.get("savings", 1.5),
+            )
+        user.calc_streak()
+        await store(ctx).asave(user)
     _schedule_user_jobs(ctx.application, user)
     await update.message.reply_text(
         f"Alles klar. Tag {user.streak_days} startet jetzt.\n\n"
@@ -294,17 +316,23 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
         return
-    user = await store(ctx).aload(update.effective_user.id)
-    if not user:
-        await update.message.reply_text("Starte zuerst mit /start.")
-        return
-    user.calc_streak()
-    await store(ctx).asave(user)
+    uid = update.effective_user.id
+    async with _user_lock(ctx, uid):
+        user = await store(ctx).aload(uid)
+        if not user:
+            await update.message.reply_text("Starte zuerst mit /start.")
+            return
+        user.calc_streak()
+        await store(ctx).asave(user)
+        streak_days = user.streak_days
+        longest_streak = user.longest_streak
+        savings = user.savings()
+        relapses = user.relapses
     await update.message.reply_text(
-        f"🔥 Streak: {user.streak_days} Tag(e)\n"
-        f"🏆 Längster: {user.longest_streak} Tag(e)\n"
-        f"💶 Gespart: €{user.savings():.2f}\n"
-        f"🎯 Rückfälle: {user.relapses}"
+        f"🔥 Streak: {streak_days} Tag(e)\n"
+        f"🏆 Längster: {longest_streak} Tag(e)\n"
+        f"💶 Gespart: €{savings:.2f}\n"
+        f"🎯 Rückfälle: {relapses}"
     )
 
 async def cmd_why(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -322,71 +350,74 @@ async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not ctx.args or ctx.args[0].lower() != "confirm":
         await update.message.reply_text("Das setzt deinen Streak zurück. /reset confirm wenn du sicher bist.")
         return
-    user = await store(ctx).aload(update.effective_user.id)
-    if not user:
-        await update.message.reply_text("Kein Profil. /start zuerst.")
-        return
-    user.reset_streak()
-    await store(ctx).asave(user)
+    uid = update.effective_user.id
+    async with _user_lock(ctx, uid):
+        user = await store(ctx).aload(uid)
+        if not user:
+            await update.message.reply_text("Kein Profil. /start zuerst.")
+            return
+        user.reset_streak()
+        await store(ctx).asave(user)
     await update.message.reply_text("Reset. Tag 1 startet jetzt. Du bist nicht hinten dran — du bist wieder im Kampf.")
 
 async def cmd_undo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
         return
-    user = await store(ctx).aload(update.effective_user.id)
-    if not user:
-        await update.message.reply_text("Kein Profil. /start zuerst.")
-        return
-    if not user.last_relapse_reset:
-        await update.message.reply_text("Kein Reset zum Rückgängigmachen.")
-        return
-    if not user.undo_reset():
-        await update.message.reply_text("Undo-Fenster abgelaufen (5 Min).")
-        return
-    # Recompute streak from the restored quit_date — time may have passed
-    # since the reset, so the snapshot value can be stale.
-    user.calc_streak()
-    await store(ctx).asave(user)
-    await update.message.reply_text(f"Undo erledigt. Wiederhergestellt auf Tag {user.streak_days}.")
+    uid = update.effective_user.id
+    async with _user_lock(ctx, uid):
+        user = await store(ctx).aload(uid)
+        if not user:
+            await update.message.reply_text("Kein Profil. /start zuerst.")
+            return
+        if not user.last_relapse_reset:
+            await update.message.reply_text("Kein Reset zum Rückgängigmachen.")
+            return
+        if not user.undo_reset():
+            await update.message.reply_text("Undo-Fenster abgelaufen (5 Min).")
+            return
+        # Recompute streak from the restored quit_date — time may have passed
+        # since the reset, so the snapshot value can be stale.
+        user.calc_streak()
+        await store(ctx).asave(user)
+        streak_days = user.streak_days
+    await update.message.reply_text(f"Undo erledigt. Wiederhergestellt auf Tag {streak_days}.")
 
 async def cmd_savings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
         return
-    user = await store(ctx).aload(update.effective_user.id)
-    if not user:
-        await update.message.reply_text("Starte zuerst mit /start.")
-        return
+    uid = update.effective_user.id
     args = ctx.args or []
-    if args and args[0] == "set" and len(args) >= 2:
-        try:
-            user.savings_per_day = max(0, round(float(args[1]), 2))
-            await store(ctx).asave(user)
-            await update.message.reply_text(f"Gespeichert: €{user.savings_per_day:.2f}/Tag.")
-        except ValueError:
-            await update.message.reply_text("Bitte: /savings set 15")
-        return
-    if args and args[0] == "goal" and len(args) >= 2:
-        try:
-            user.savings_goal = max(0, round(float(args[1]), 2))
-            await store(ctx).asave(user)
-            await update.message.reply_text(f"🎯 Sparziel: €{user.savings_goal:.2f}")
-        except ValueError:
-            await update.message.reply_text("Bitte: /savings goal 500")
-        return
-    user.calc_streak()
-    msg = f"💶 Gespart: €{user.savings():.2f} ({user.streak_days} Tage × €{user.savings_per_day:.2f})"
-    if user.savings_goal > 0:
-        pct = min(100, user.savings() / user.savings_goal * 100)
-        msg += f"\n🎯 Ziel: €{user.savings_goal:.2f} ({pct:.0f}%)"
+    async with _user_lock(ctx, uid):
+        user = await store(ctx).aload(uid)
+        if not user:
+            await update.message.reply_text("Starte zuerst mit /start.")
+            return
+        if args and args[0] == "set" and len(args) >= 2:
+            try:
+                user.savings_per_day = max(0, round(float(args[1]), 2))
+                await store(ctx).asave(user)
+                await update.message.reply_text(f"Gespeichert: €{user.savings_per_day:.2f}/Tag.")
+            except ValueError:
+                await update.message.reply_text("Bitte: /savings set 15")
+            return
+        if args and args[0] == "goal" and len(args) >= 2:
+            try:
+                user.savings_goal = max(0, round(float(args[1]), 2))
+                await store(ctx).asave(user)
+                await update.message.reply_text(f"🎯 Sparziel: €{user.savings_goal:.2f}")
+            except ValueError:
+                await update.message.reply_text("Bitte: /savings goal 500")
+            return
+        user.calc_streak()
+        msg = f"💶 Gespart: €{user.savings():.2f} ({user.streak_days} Tage × €{user.savings_per_day:.2f})"
+        if user.savings_goal > 0:
+            pct = min(100, user.savings() / user.savings_goal * 100)
+            msg += f"\n🎯 Ziel: €{user.savings_goal:.2f} ({pct:.0f}%)"
     await update.message.reply_text(msg)
 
 async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Quick check-in: /check <mood> [craving] [stress] (1-10 each)."""
     if not update.message or not update.effective_user:
-        return
-    user = await store(ctx).aload(update.effective_user.id)
-    if not user:
-        await update.message.reply_text("Starte zuerst mit /start.")
         return
     args = ctx.args or []
     if not args:
@@ -409,9 +440,15 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     mood = vals[0]
     craving = vals[1] if len(vals) > 1 else None
     stress = vals[2] if len(vals) > 2 else None
-    entry = {"date": _user_now(user).isoformat(), "morning": mood, "craving": craving, "stress": stress}
-    user.mood_log.append(entry)
-    await store(ctx).asave(user)
+    uid = update.effective_user.id
+    async with _user_lock(ctx, uid):
+        user = await store(ctx).aload(uid)
+        if not user:
+            await update.message.reply_text("Starte zuerst mit /start.")
+            return
+        entry = {"date": _user_now(user).isoformat(), "morning": mood, "craving": craving, "stress": stress}
+        user.mood_log.append(entry)
+        await store(ctx).asave(user)
     parts = [f"Stimmung: {mood}/10"]
     if craving is not None:
         parts.append(f"Craving: {craving}/10")
@@ -455,15 +492,17 @@ async def cmd_journal(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def on_journal_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not update.message or not update.effective_user:
         return ConversationHandler.END
-    user = await store(ctx).aload(update.effective_user.id)
-    if not user:
-        return ConversationHandler.END
     text = (update.message.text or "").strip()
     if not text:
         await update.message.reply_text("Schreib einfach deinen Gedanken — oder /cancel.")
         return J_WRITE
-    user.journal.append({"date": _user_now(user).isoformat(), "text": text})
-    await store(ctx).asave(user)
+    uid = update.effective_user.id
+    async with _user_lock(ctx, uid):
+        user = await store(ctx).aload(uid)
+        if not user:
+            return ConversationHandler.END
+        user.journal.append({"date": _user_now(user).isoformat(), "text": text})
+        await store(ctx).asave(user)
     await update.message.reply_text("Gespeichert. Starker Move — Bewusstsein schlägt Autopilot. 📝")
     return ConversationHandler.END
 
@@ -702,10 +741,12 @@ async def on_contact(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ud["emergency_contact"] = contact
     # Persist to UserState for restart resilience
     if update.effective_user:
-        user = await store(ctx).aload(update.effective_user.id)
-        if user:
-            user.emergency_contact = contact
-            await store(ctx).asave(user)
+        uid = update.effective_user.id
+        async with _user_lock(ctx, uid):
+            user = await store(ctx).aload(uid)
+            if user:
+                user.emergency_contact = contact
+                await store(ctx).asave(user)
     await update.effective_message.reply_text(f"✅ Notfallkontakt gespeichert: {contact}")
     await update.effective_message.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
     return C_MENU
@@ -720,10 +761,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text
     uid = update.effective_user.id
 
-    # Per-user AI lock: refuse overlapping calls so a spamming user can't
-    # trigger N parallel API requests burning credits + racing Store writes.
-    locks: dict[int, asyncio.Lock] = ctx.bot_data.setdefault("_ai_locks", {})
-    lock = locks.setdefault(uid, asyncio.Lock())
+    # Soft spam guard: if the per-user lock is already held (an earlier AI
+    # call still in flight, or another handler mid-update), bail out with a
+    # nudge instead of queuing another LLM round-trip.
+    lock = _user_lock(ctx, uid)
     if lock.locked():
         await update.message.reply_text("Einen Moment — ich antworte gerade auf deine letzte Nachricht.")
         return
@@ -785,15 +826,17 @@ async def on_relapse_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not q or not q.data or not update.effective_user:
         return
     await q.answer()
-    user = await store(ctx).aload(update.effective_user.id)
-    if not user or not q.message:
-        return
-    if q.data == "rel:yes":
-        user.reset_streak()
-        await store(ctx).asave(user)
-        await q.message.reply_text("Danke für deine Ehrlichkeit. Tag 1. /undo innerhalb 5 Min wenn Fehler.")
-    else:
-        await q.message.reply_text("Danke fürs Klarstellen. Dein Streak bleibt. Du machst das gut.")
+    uid = update.effective_user.id
+    async with _user_lock(ctx, uid):
+        user = await store(ctx).aload(uid)
+        if not user or not q.message:
+            return
+        if q.data == "rel:yes":
+            user.reset_streak()
+            await store(ctx).asave(user)
+            await q.message.reply_text("Danke für deine Ehrlichkeit. Tag 1. /undo innerhalb 5 Min wenn Fehler.")
+        else:
+            await q.message.reply_text("Danke fürs Klarstellen. Dein Streak bleibt. Du machst das gut.")
 
 # ══════════════════════════════════════════════════════════════════════════
 # PROACTIVE MESSAGES (morning, nudge, evening)
@@ -874,10 +917,16 @@ def _schedule_user_jobs(app: Application, user: UserState) -> None:
         await send_evening(app, uid)
 
     jq.run_daily(_job_morning, time=time(wake.hour, wake.minute, tzinfo=tz), name=f"m_{uid}")
-    # Nudge = 6h after wake, capped at 20:00 so we never cross midnight and
-    # always land on a sensible wall-clock hour regardless of wake_time.
+    # Nudge = 6h after wake, capped at 20:00 for normal cases. For late risers
+    # (wake hour > 14) the cap can land before wake — fall back to wake + 1h,
+    # bounded by 23:59 so we never cross midnight.
     nudge_h = min(wake.hour + 6, 20)
     nudge_m = wake.minute if nudge_h == wake.hour + 6 else 0
+    nudge_total = nudge_h * 60 + nudge_m
+    wake_total = wake.hour * 60 + wake.minute
+    if nudge_total <= wake_total:
+        nudge_total = min(wake_total + 60, 23 * 60 + 59)
+        nudge_h, nudge_m = divmod(nudge_total, 60)
     jq.run_daily(_job_nudge, time=time(nudge_h, nudge_m, tzinfo=tz), name=f"n_{uid}")
     jq.run_daily(_job_evening, time=time(21, 0, tzinfo=tz), name=f"e_{uid}")
 
