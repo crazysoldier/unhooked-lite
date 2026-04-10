@@ -20,7 +20,7 @@ import logging
 import os
 from datetime import date, datetime, time, timedelta
 from typing import cast
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dotenv import load_dotenv
 
 from telegram import (
@@ -60,7 +60,7 @@ ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Vienna")
 try:
     ZoneInfo(TIMEZONE)
-except Exception:
+except ZoneInfoNotFoundError:
     log.error("Invalid TIMEZONE: %s. Falling back to Europe/Vienna.", TIMEZONE)
     TIMEZONE = "Europe/Vienna"
 DATA_DIR = os.getenv("DATA_DIR", "./data")
@@ -93,8 +93,23 @@ def _parse_time(s: str) -> time:
     try:
         h, m = s.split(":")
         return time(int(h), int(m))
-    except Exception:
+    except (ValueError, AttributeError):
         return time(7, 30)
+
+
+def _user_tz(user: UserState | None) -> ZoneInfo:
+    """Return user's timezone as a ZoneInfo, falling back to global TIMEZONE."""
+    tz_name = (user.timezone if user and user.timezone else TIMEZONE) or TIMEZONE
+    try:
+        return ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        log.warning("Invalid timezone '%s', falling back to %s", tz_name, TIMEZONE)
+        return ZoneInfo(TIMEZONE)
+
+
+def _now_iso(user: UserState | None) -> str:
+    """Return current ISO timestamp in the user's configured timezone."""
+    return datetime.now(_user_tz(user)).isoformat()
 
 # ── Security ──────────────────────────────────────────────────────────────
 
@@ -225,9 +240,13 @@ async def on_why(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ud = ctx.user_data
     why = (update.message.text or "").strip()
     quit_days = ud.get("quit_days", 0)
-    quit_date = datetime.now(ZoneInfo(TIMEZONE)).date() - timedelta(days=quit_days)
     # Preserve existing user data (journal, mood_log, chat_history, etc.)
     existing = store(ctx).load(update.effective_user.id)
+    # Use the user's existing timezone if set, otherwise the global default.
+    # This also ensures the quit_date is computed in the same timezone that
+    # models._today() will later use for streak calculations.
+    tz_name = existing.timezone if existing and existing.timezone else TIMEZONE
+    quit_date = datetime.now(_user_tz(existing)).date() - timedelta(days=quit_days)
     if existing:
         existing.username = update.effective_user.username or ""
         existing.habit = ud.get("habit", "Other")
@@ -235,7 +254,7 @@ async def on_why(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         existing.quit_date = quit_date.isoformat()
         existing.wake_time = ud.get("wake", "07:30")
         existing.triggers = ud.get("sel_trigs", [])
-        existing.timezone = TIMEZONE
+        # Preserve existing.timezone (do not overwrite user preference)
         existing.savings_per_day = ud.get("savings", 1.5)
         user = existing
     else:
@@ -247,7 +266,7 @@ async def on_why(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             quit_date=quit_date.isoformat(),
             wake_time=ud.get("wake", "07:30"),
             triggers=ud.get("sel_trigs", []),
-            timezone=TIMEZONE,
+            timezone=tz_name,
             savings_per_day=ud.get("savings", 1.5),
         )
     user.calc_streak()
@@ -368,16 +387,21 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not args:
         await update.message.reply_text("Nutzung: /check 7 3 2 (Stimmung Craving Stress)")
         return
-    vals = []
-    for a in args[:3]:
-        try:
-            vals.append(max(1, min(10, int(a))))
-        except ValueError:
-            pass
-    mood = vals[0] if vals else 5
+    # Reject any invalid token — don't silently skip and log fabricated data.
+    try:
+        vals = [max(1, min(10, int(a))) for a in args[:3]]
+    except ValueError:
+        await update.message.reply_text(
+            "Bitte nur Zahlen 1-10, z.B. /check 7 3 2 (Stimmung Craving Stress)"
+        )
+        return
+    if not vals:
+        await update.message.reply_text("Nutzung: /check 7 3 2 (Stimmung Craving Stress)")
+        return
+    mood = vals[0]
     craving = vals[1] if len(vals) > 1 else None
     stress = vals[2] if len(vals) > 2 else None
-    entry = {"date": datetime.now(ZoneInfo("UTC")).isoformat(), "morning": mood, "craving": craving, "stress": stress}
+    entry = {"date": _now_iso(user), "morning": mood, "craving": craving, "stress": stress}
     user.mood_log.append(entry)
     store(ctx).save(user)
     parts = [f"Stimmung: {mood}/10"]
@@ -430,7 +454,7 @@ async def on_journal_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
     if not text:
         await update.message.reply_text("Schreib einfach deinen Gedanken — oder /cancel.")
         return J_WRITE
-    user.journal.append({"date": datetime.now(ZoneInfo("UTC")).isoformat(), "text": text})
+    user.journal.append({"date": _now_iso(user), "text": text})
     store(ctx).save(user)
     await update.message.reply_text("Gespeichert. Starker Move — Bewusstsein schlägt Autopilot. 📝")
     return ConversationHandler.END
@@ -514,13 +538,8 @@ async def sos_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             range(12, 17): "💪 Workout | 🍳 Kochen | 🧹 Aufräumen",
             range(17, 22): "📖 Lesen | 🎧 Podcast | 🤸 Stretching",
         }
-        user_tz = TIMEZONE
-        if update.effective_user:
-            u = store(ctx).load(update.effective_user.id)
-            if u and u.timezone:
-                user_tz = u.timezone
-        tz = ZoneInfo(user_tz)
-        h = datetime.now(tz).hour
+        u = store(ctx).load(update.effective_user.id) if update.effective_user else None
+        h = datetime.now(_user_tz(u)).hour
         tip = next((v for r, v in tips.items() if h in r), "🫁 Atemübung | 🍵 Tee | 📝 Journaling")
         await msg.reply_text(tip)
         await msg.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
@@ -553,7 +572,7 @@ async def _run_breathing(msg: Message) -> None:
     await msg.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
 
 # Grounding steps
-async def _g_step(update, next_s, prompt):
+async def _g_step(update: Update, next_s: int, prompt: str) -> int:
     if isinstance(update.effective_message, Message):
         await update.effective_message.reply_text(prompt)
     return next_s
@@ -670,7 +689,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("Hast du wirklich konsumiert?", reply_markup=kb)
             return
         if kind == "journal":
-            user.journal.append({"date": datetime.now(ZoneInfo("UTC")).isoformat(), "text": data})
+            user.journal.append({"date": _now_iso(user), "text": data})
             store(ctx).save(user)
             await update.message.reply_text("Gespeichert. 📝")
             return
@@ -774,7 +793,7 @@ async def send_evening(app: Application, uid: int) -> None:
 def _schedule_user_jobs(app: Application, user: UserState) -> None:
     try:
         tz = ZoneInfo(user.timezone or TIMEZONE)
-    except Exception:
+    except ZoneInfoNotFoundError:
         log.warning("Invalid timezone '%s' for user %d, falling back to %s", user.timezone, user.user_id, TIMEZONE)
         tz = ZoneInfo(TIMEZONE)
     wake = _parse_time(user.wake_time)
@@ -919,4 +938,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
- 
