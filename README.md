@@ -46,8 +46,16 @@ Optional:
 **Option A: Docker**
 ```bash
 docker build -t unhooked-lite .
+
+# Using OpenAI (default provider)
 docker run -e BOT_TOKEN=<your_token> -e OPENAI_API_KEY=<key> unhooked-lite
+
+# Or using Anthropic
+docker run -e BOT_TOKEN=<your_token> \
+  -e AI_PROVIDER=anthropic -e AI_MODEL=claude-3-5-sonnet-20241022 \
+  -e ANTHROPIC_API_KEY=<key> unhooked-lite
 ```
+At least one of `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` is required.
 
 **Option B: Local Python**
 ```bash
