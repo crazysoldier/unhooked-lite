@@ -522,7 +522,7 @@ async def sos_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             if user and user.emergency_contact:
                 contact = user.emergency_contact
         if not contact:
-            contact = (ctx.user_data).get("emergency_contact")
+            contact = ctx.user_data.get("emergency_contact")
         if contact:
             await msg.reply_text(f"Dein Notfallkontakt: {contact}\n\nRuf jetzt an.")
             await msg.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
@@ -574,10 +574,18 @@ async def _g_step(update: Update, next_s: int, prompt: str) -> int:
         await update.effective_message.reply_text(prompt)
     return next_s
 
-async def g1(u, c): return await _g_step(u, C_G2, "👂 Gut. 4 Dinge, die du HÖRST:")
-async def g2(u, c): return await _g_step(u, C_G3, "✋ 3 Dinge, die du FÜHLST/BERÜHRST:")
-async def g3(u, c): return await _g_step(u, C_G4, "👃 2 Dinge, die du RIECHST:")
-async def g4(u, c): return await _g_step(u, C_G5, "👅 1 Ding, das du SCHMECKST:")
+async def g1(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _g_step(update, C_G2, "👂 Gut. 4 Dinge, die du HÖRST:")
+
+async def g2(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _g_step(update, C_G3, "✋ 3 Dinge, die du FÜHLST/BERÜHRST:")
+
+async def g3(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _g_step(update, C_G4, "👃 2 Dinge, die du RIECHST:")
+
+async def g4(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _g_step(update, C_G5, "👅 1 Ding, das du SCHMECKST:")
+
 async def g5(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if isinstance(update.effective_message, Message):
         await update.effective_message.reply_text("Gut gemacht. Du bist hier. Du bist sicher. 💚")
@@ -631,7 +639,7 @@ async def surf_r2(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         r2 = int(q.data.split("_")[1])
     except (IndexError, ValueError):
         return ConversationHandler.END
-    r1 = (ctx.user_data).get("surf_r1", r2)
+    r1 = ctx.user_data.get("surf_r1", r2)
     diff = r1 - r2
     if diff > 0:
         txt = f"Vorher: {r1}/10 → Jetzt: {r2}/10\n\n📉 {diff} Punkte weniger. Die Welle geht vorbei."
@@ -814,12 +822,10 @@ def _schedule_user_jobs(app: Application, user: UserState) -> None:
         await send_evening(app, uid)
 
     jq.run_daily(_job_morning, time=time(wake.hour, wake.minute, tzinfo=tz), name=f"m_{uid}")
-    # Nudge = 6h after wake, clamped to [wake+6h, 21:00] without day-wraparound.
-    nudge_hour = wake.hour + 6
-    if nudge_hour >= 21:
-        nudge_h, nudge_m = 14, 0  # fall back to early afternoon for late risers
-    else:
-        nudge_h, nudge_m = nudge_hour, wake.minute
+    # Nudge = 6h after wake, capped at 20:00 so we never cross midnight and
+    # always land on a sensible wall-clock hour regardless of wake_time.
+    nudge_h = min(wake.hour + 6, 20)
+    nudge_m = wake.minute if nudge_h == wake.hour + 6 else 0
     jq.run_daily(_job_nudge, time=time(nudge_h, nudge_m, tzinfo=tz), name=f"n_{uid}")
     jq.run_daily(_job_evening, time=time(21, 0, tzinfo=tz), name=f"e_{uid}")
 
