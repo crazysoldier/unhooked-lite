@@ -1,0 +1,1081 @@
+"""Unhooked Lite — complete Telegram bot in one file.
+
+Replaces the original's 40+ files with a single entry point that handles:
+- Onboarding (/start)
+- Streak tracking (/status, /reset, /undo)
+- Crisis toolkit (/sos — grounding, breathing, urge surfing, call, distraction)
+- AI coaching (free-text messages via OpenAI or Anthropic)
+- Journaling (/journal)
+- Savings tracking (/savings)
+- Quick mood check-in (/check)
+- Proactive scheduled messages (morning, nudge, evening)
+- Chat whitelist security
+
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import weakref
+from datetime import date, datetime, time, timedelta
+from typing import cast
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from dotenv import load_dotenv
+
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    Update,
+)
+from telegram.error import TelegramError
+from telegram.ext import (
+    Application,
+    ApplicationHandlerStop,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    JobQueue,
+    MessageHandler,
+    TypeHandler,
+    filters,
+)
+
+from coach import AIClient, History, detect_intent
+from models import Store, UserState
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("unhooked")
+
+# ── Config ────────────────────────────────────────────────────────────────
+
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+AI_PROVIDER = os.getenv("AI_PROVIDER", "openai").lower()
+AI_MODEL = os.getenv("AI_MODEL", "gpt-4o")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
+TIMEZONE = os.getenv("TIMEZONE", "Europe/Vienna")
+try:
+    ZoneInfo(TIMEZONE)
+except (ZoneInfoNotFoundError, ValueError, TypeError):
+    log.error("Invalid TIMEZONE: %s. Falling back to Europe/Vienna.", TIMEZONE)
+    TIMEZONE = "Europe/Vienna"
+DATA_DIR = os.getenv("DATA_DIR", "./data")
+
+_raw_ids = os.getenv("ALLOWED_TELEGRAM_CHAT_IDS", "")
+ALLOWED_IDS: set[int] = set()
+if _raw_ids:
+    for x in _raw_ids.split(","):
+        if x.strip():
+            try:
+                ALLOWED_IDS.add(int(x.strip()))
+            except ValueError:
+                log.error("Invalid ID in ALLOWED_TELEGRAM_CHAT_IDS: %s", x)
+
+# ── Helpers ───────────────────────────────────────────────────────────────
+
+def store(ctx: ContextTypes.DEFAULT_TYPE) -> Store:
+    return ctx.bot_data["store"]
+
+def ai(ctx: ContextTypes.DEFAULT_TYPE) -> AIClient:
+    return ctx.bot_data["ai"]
+
+def hist(ctx: ContextTypes.DEFAULT_TYPE) -> History:
+    return ctx.bot_data["history"]
+
+
+# Module-level lock table — intentionally NOT stored in `ctx.bot_data` so
+# that a future `PicklePersistence` setup doesn't try (and fail) to pickle
+# these non-serializable objects. Locks are pure in-memory state tied to
+# the running event loop; they have no meaning across restarts.
+_user_locks: weakref.WeakValueDictionary[int, asyncio.Lock] = weakref.WeakValueDictionary()
+
+
+def _user_lock(_ctx: ContextTypes.DEFAULT_TYPE, uid: int) -> asyncio.Lock:
+    """Per-user lock that serializes load-modify-save cycles on UserState.
+
+    Required because async I/O (asave/aload via to_thread) yields the event
+    loop, so without explicit serialization a slow handler (e.g. on_text
+    awaiting an LLM call) can be interleaved with another handler — or a
+    JobQueue job — touching the same user file. The interleaved save would
+    clobber the slower handler's eventual write.
+
+    Created lazily; reused per uid. on_text uses `lock.locked()` as a soft
+    spam check before entering, so a user spamming free-text doesn't queue
+    parallel API calls.
+
+    Stored in a WeakValueDictionary so locks for inactive users are garbage-
+    collected once no handler / waiter holds a strong reference. This keeps
+    memory bounded as the user base grows without an explicit TTL sweep.
+    Safe because:
+    - The caller holds a strong reference via `async with _user_lock(...)`.
+    - Any coroutines blocked in `acquire()` also hold a strong reference.
+    - There is no `await` between `get` and the assignment below, so another
+      coroutine cannot observe a half-built entry.
+    """
+    lock = _user_locks.get(uid)
+    if lock is None:
+        lock = asyncio.Lock()
+        _user_locks[uid] = lock
+    return lock
+
+
+_TG_MSG_LIMIT = 4096  # Telegram max message length
+_TG_SPLIT_AT = 4000   # Split threshold (leave room for edge cases)
+
+def _user_now(user: UserState) -> datetime:
+    """Timezone-aware 'now' for the user (falls back to global TIMEZONE)."""
+    try:
+        return datetime.now(ZoneInfo(user.timezone or TIMEZONE))
+    except (ZoneInfoNotFoundError, ValueError, TypeError):
+        return datetime.now(ZoneInfo(TIMEZONE))
+
+def _parse_time(s: str) -> time:
+    try:
+        h, m = s.split(":")
+        return time(int(h), int(m))
+    except (ValueError, AttributeError):
+        log.warning("Invalid wake_time %r, falling back to 07:30", s)
+        return time(7, 30)
+
+# ── Security ──────────────────────────────────────────────────────────────
+
+async def _guard(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ALLOWED_IDS:
+        return
+    chat = update.effective_chat
+    if chat and chat.id in ALLOWED_IDS:
+        return
+    if not ctx.chat_data.get("denied"):
+        msg = update.effective_message
+        if msg:
+            await msg.reply_text("Private Beta. Zugang noch nicht freigeschaltet.")
+        ctx.chat_data["denied"] = True
+    raise ApplicationHandlerStop
+
+# ══════════════════════════════════════════════════════════════════════════
+# ONBOARDING  (/start)
+# ══════════════════════════════════════════════════════════════════════════
+
+HABITS = [
+    ("🌿 Cannabis", "Cannabis"), ("🚬 Spliffs", "Spliffs"),
+    ("🎮 Gaming", "Gaming"), ("🔞 Porn", "Porn"),
+    ("🛍️ Kaufsucht", "Kaufsucht"), ("💔 Toxische Beziehung", "Toxic"),
+    ("✏️ Anderes", None),
+]
+LAST_USE = [("today", 0), ("yesterday", 1), ("2-3 days", 2), ("week+", 7)]
+TRIGGERS = ["Langeweile", "Stress", "Angst", "Einsamkeit", "Sozialer Druck", "Abends", "Morgens"]
+
+S_HABIT, S_HABIT_TXT, S_LAST, S_WAKE, S_SAVINGS, S_TRIG, S_WHY = range(7)
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message:
+        return ConversationHandler.END
+    kb = [[InlineKeyboardButton(label, callback_data=f"h:{name or 'other'}")] for label, name in HABITS]
+    await update.message.reply_text("Hey. Ich bin dein Unhooked Coach. Bereit, die Kontrolle zurückzuholen?")
+    await update.message.reply_text("Was möchtest du verändern?", reply_markup=InlineKeyboardMarkup(kb))
+    return S_HABIT
+
+async def on_habit(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    if not q or not q.data:
+        return ConversationHandler.END
+    await q.answer()
+    val = q.data.split(":", 1)[1]
+    ud = ctx.user_data
+    if val == "other":
+        await q.message.reply_text("Was möchtest du verändern? (Schreib es einfach)")
+        return S_HABIT_TXT
+    ud["habit"] = val
+    kb = [[InlineKeyboardButton(f"{k} ({d}d)", callback_data=f"l:{d}")] for k, d in LAST_USE]
+    await q.message.reply_text("Wann war dein letzter Konsum?", reply_markup=InlineKeyboardMarkup(kb))
+    return S_LAST
+
+async def on_habit_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message:
+        return ConversationHandler.END
+    ud = ctx.user_data
+    ud["habit"] = (update.message.text or "Other").strip()[:50]
+    kb = [[InlineKeyboardButton(f"{k} ({d}d)", callback_data=f"l:{d}")] for k, d in LAST_USE]
+    await update.message.reply_text("Wann war dein letzter Konsum?", reply_markup=InlineKeyboardMarkup(kb))
+    return S_LAST
+
+async def on_last_use(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    if not q or not q.data:
+        return ConversationHandler.END
+    await q.answer()
+    ud = ctx.user_data
+    ud["quit_days"] = int(q.data.split(":")[1])
+    await q.message.reply_text("Wann stehst du normalerweise auf? (HH:MM)")
+    return S_WAKE
+
+async def on_wake(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message:
+        return ConversationHandler.END
+    text = (update.message.text or "").strip()
+    try:
+        h, m = text.split(":")
+        time(int(h), int(m))
+    except ValueError:
+        await update.message.reply_text("Bitte gib die Zeit im Format HH:MM an (z.B. 07:30).")
+        return S_WAKE
+    ud = ctx.user_data
+    ud["wake"] = text
+    await update.message.reply_text("Wie viel gibst du ungefähr pro Tag dafür aus? (z.B. 15)")
+    return S_SAVINGS
+
+async def on_savings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message:
+        return ConversationHandler.END
+    ud = ctx.user_data
+    try:
+        ud["savings"] = max(0.0, round(float((update.message.text or "0").replace(",", ".")), 2))
+    except ValueError:
+        await update.message.reply_text("Bitte gib eine Zahl ein, z.B. 15")
+        return S_SAVINGS
+    ud["sel_trigs"] = []
+    await update.message.reply_text("Wann schlagen Cravings am härtesten zu?", reply_markup=_trig_kb(set()))
+    return S_TRIG
+
+def _trig_kb(sel: set[str]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(("✅ " if t in sel else "") + t, callback_data=f"t:{t}")] for t in TRIGGERS]
+    rows.append([InlineKeyboardButton("✔️ Fertig", callback_data="t:DONE")])
+    return InlineKeyboardMarkup(rows)
+
+async def on_trigger(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    if not q or not q.data:
+        return ConversationHandler.END
+    await q.answer()
+    val = q.data.split(":", 1)[1]
+    ud = ctx.user_data
+    sel: list[str] = ud.setdefault("sel_trigs", [])
+    if val == "DONE":
+        await q.message.reply_text("Was ist dein WARUM? Wofür machst du das?")
+        return S_WHY
+    if val in sel:
+        sel.remove(val)
+    else:
+        sel.append(val)
+    await q.edit_message_reply_markup(reply_markup=_trig_kb(set(sel)))
+    return S_TRIG
+
+async def on_why(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message or not update.effective_user:
+        return ConversationHandler.END
+    ud = ctx.user_data
+    why = (update.message.text or "").strip()
+    quit_days = ud.get("quit_days", 0)
+    uid = update.effective_user.id
+    async with _user_lock(ctx, uid):
+        # Preserve existing user data (journal, mood_log, chat_history, etc.)
+        existing = await store(ctx).aload(uid)
+        # Use the user's own timezone when re-onboarding; fall back to global.
+        user_tz_name = existing.timezone if existing and existing.timezone else TIMEZONE
+        try:
+            user_tz = ZoneInfo(user_tz_name)
+        except (ZoneInfoNotFoundError, ValueError, TypeError):
+            user_tz_name = TIMEZONE
+            user_tz = ZoneInfo(TIMEZONE)
+        quit_date = datetime.now(user_tz).date() - timedelta(days=quit_days)
+        if existing:
+            existing.username = update.effective_user.username or ""
+            existing.habit = ud.get("habit", "Other")
+            existing.why = why
+            existing.quit_date = quit_date.isoformat()
+            existing.wake_time = ud.get("wake", "07:30")
+            existing.triggers = ud.get("sel_trigs", [])
+            existing.timezone = user_tz_name
+            existing.savings_per_day = ud.get("savings", 1.5)
+            user = existing
+        else:
+            user = UserState(
+                user_id=uid,
+                username=update.effective_user.username or "",
+                habit=ud.get("habit", "Other"),
+                why=why,
+                quit_date=quit_date.isoformat(),
+                wake_time=ud.get("wake", "07:30"),
+                triggers=ud.get("sel_trigs", []),
+                timezone=user_tz_name,
+                savings_per_day=ud.get("savings", 1.5),
+            )
+        user.calc_streak()
+        await store(ctx).asave(user)
+    _schedule_user_jobs(ctx.application, user.user_id, user.timezone, user.wake_time)
+    await update.message.reply_text(
+        f"Alles klar. Tag {user.streak_days} startet jetzt.\n\n"
+        f"Dein WARUM: {why}\n\n"
+        "Ich bin rund um die Uhr für dich da. Schreib mir einfach. 🪝"
+    )
+    ud.clear()
+    return ConversationHandler.END
+
+async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    # Cancel any in-flight SOS background tasks and drop per-conversation state
+    # so a fresh /start or /sos doesn't inherit leftovers.
+    if ctx.user_data is not None:
+        _cancel_sos_tasks(ctx.user_data)
+        ctx.user_data.clear()
+    if update.message:
+        await update.message.reply_text("Abgebrochen. /start wenn du bereit bist.")
+    return ConversationHandler.END
+
+# ══════════════════════════════════════════════════════════════════════════
+# TRACKING  (/status, /reset, /undo, /why, /savings, /check)
+# ══════════════════════════════════════════════════════════════════════════
+
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    uid = update.effective_user.id
+    async with _user_lock(ctx, uid):
+        user = await store(ctx).aload(uid)
+        if not user:
+            await update.message.reply_text("Starte zuerst mit /start.")
+            return
+        user.calc_streak()
+        await store(ctx).asave(user)
+        streak_days = user.streak_days
+        longest_streak = user.longest_streak
+        savings = user.savings()
+        relapses = user.relapses
+    await update.message.reply_text(
+        f"🔥 Streak: {streak_days} Tag(e)\n"
+        f"🏆 Längster: {longest_streak} Tag(e)\n"
+        f"💶 Gespart: €{savings:.2f}\n"
+        f"🎯 Rückfälle: {relapses}"
+    )
+
+async def cmd_why(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    user = await store(ctx).aload(update.effective_user.id)
+    if not user or not user.why:
+        await update.message.reply_text("Setz dein WARUM in /start.")
+        return
+    await update.message.reply_text(f"Dein WARUM: {user.why}")
+
+async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not ctx.args or ctx.args[0].lower() != "confirm":
+        await update.message.reply_text("Das setzt deinen Streak zurück. /reset confirm wenn du sicher bist.")
+        return
+    uid = update.effective_user.id
+    async with _user_lock(ctx, uid):
+        user = await store(ctx).aload(uid)
+        if not user:
+            await update.message.reply_text("Kein Profil. /start zuerst.")
+            return
+        user.reset_streak()
+        await store(ctx).asave(user)
+    await update.message.reply_text("Reset. Tag 1 startet jetzt. Du bist nicht hinten dran — du bist wieder im Kampf.")
+
+async def cmd_undo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    uid = update.effective_user.id
+    async with _user_lock(ctx, uid):
+        user = await store(ctx).aload(uid)
+        if not user:
+            await update.message.reply_text("Kein Profil. /start zuerst.")
+            return
+        if not user.last_relapse_reset:
+            await update.message.reply_text("Kein Reset zum Rückgängigmachen.")
+            return
+        if not user.undo_reset():
+            await update.message.reply_text("Undo-Fenster abgelaufen (5 Min).")
+            return
+        # Recompute streak from the restored quit_date — time may have passed
+        # since the reset, so the snapshot value can be stale.
+        user.calc_streak()
+        await store(ctx).asave(user)
+        streak_days = user.streak_days
+    await update.message.reply_text(f"Undo erledigt. Wiederhergestellt auf Tag {streak_days}.")
+
+async def cmd_savings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    uid = update.effective_user.id
+    args = ctx.args or []
+    async with _user_lock(ctx, uid):
+        user = await store(ctx).aload(uid)
+        if not user:
+            await update.message.reply_text("Starte zuerst mit /start.")
+            return
+        if args and args[0] == "set" and len(args) >= 2:
+            try:
+                user.savings_per_day = max(0, round(float(args[1]), 2))
+                await store(ctx).asave(user)
+                await update.message.reply_text(f"Gespeichert: €{user.savings_per_day:.2f}/Tag.")
+            except ValueError:
+                await update.message.reply_text("Bitte: /savings set 15")
+            return
+        if args and args[0] == "goal" and len(args) >= 2:
+            try:
+                user.savings_goal = max(0, round(float(args[1]), 2))
+                await store(ctx).asave(user)
+                await update.message.reply_text(f"🎯 Sparziel: €{user.savings_goal:.2f}")
+            except ValueError:
+                await update.message.reply_text("Bitte: /savings goal 500")
+            return
+        user.calc_streak()
+        msg = f"💶 Gespart: €{user.savings():.2f} ({user.streak_days} Tage × €{user.savings_per_day:.2f})"
+        if user.savings_goal > 0:
+            pct = min(100, user.savings() / user.savings_goal * 100)
+            msg += f"\n🎯 Ziel: €{user.savings_goal:.2f} ({pct:.0f}%)"
+    await update.message.reply_text(msg)
+
+async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Quick check-in: /check <mood> [craving] [stress] (1-10 each)."""
+    if not update.message or not update.effective_user:
+        return
+    args = ctx.args or []
+    if not args:
+        await update.message.reply_text("Nutzung: /check 7 3 2 (Stimmung Craving Stress)")
+        return
+    vals: list[int] = []
+    invalid: list[str] = []
+    for a in args[:3]:
+        try:
+            vals.append(max(1, min(10, int(a))))
+        except ValueError:
+            invalid.append(a)
+    if not vals:
+        await update.message.reply_text("Bitte gib Zahlen ein, z.B. /check 7 3 2")
+        return
+    if invalid:
+        await update.message.reply_text(
+            f"⚠️ Übersprungen (keine Zahl): {', '.join(invalid)}"
+        )
+    mood = vals[0]
+    craving = vals[1] if len(vals) > 1 else None
+    stress = vals[2] if len(vals) > 2 else None
+    uid = update.effective_user.id
+    async with _user_lock(ctx, uid):
+        user = await store(ctx).aload(uid)
+        if not user:
+            await update.message.reply_text("Starte zuerst mit /start.")
+            return
+        entry = {"date": _user_now(user).isoformat(), "morning": mood, "craving": craving, "stress": stress}
+        user.mood_log.append(entry)
+        await store(ctx).asave(user)
+    parts = [f"Stimmung: {mood}/10"]
+    if craving is not None:
+        parts.append(f"Craving: {craving}/10")
+    if stress is not None:
+        parts.append(f"Stress: {stress}/10")
+    await update.message.reply_text("✅ " + " | ".join(parts))
+
+# ══════════════════════════════════════════════════════════════════════════
+# JOURNAL  (/journal)
+# ══════════════════════════════════════════════════════════════════════════
+
+J_WRITE = 0
+
+async def cmd_journal(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message or not update.effective_user:
+        return ConversationHandler.END
+    user = await store(ctx).aload(update.effective_user.id)
+    if not user:
+        await update.message.reply_text("Starte zuerst mit /start.")
+        return ConversationHandler.END
+    args = ctx.args or []
+    if args and args[0] == "list":
+        if not user.journal:
+            await update.message.reply_text("Noch keine Einträge.")
+            return ConversationHandler.END
+        lines = [f"#{i+1} {e['date'][:10]}: {e['text'][:60]}" for i, e in enumerate(user.journal[-10:])]
+        await update.message.reply_text("\n".join(lines))
+        return ConversationHandler.END
+    if args and args[0] == "read" and len(args) >= 2:
+        recent = user.journal[-10:]
+        try:
+            idx = int(args[1]) - 1
+            e = recent[idx]
+            await update.message.reply_text(f"#{idx+1} ({e['date'][:10]}):\n{e['text']}")
+        except (IndexError, ValueError):
+            await update.message.reply_text(f"Eintrag nicht gefunden. Du hast {len(user.journal)} Einträge.")
+        return ConversationHandler.END
+    await update.message.reply_text("📓 Schreib einfach drauf los — was beschäftigt dich gerade?\n(/cancel zum Abbrechen)")
+    return J_WRITE
+
+async def on_journal_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message or not update.effective_user:
+        return ConversationHandler.END
+    text = (update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text("Schreib einfach deinen Gedanken — oder /cancel.")
+        return J_WRITE
+    uid = update.effective_user.id
+    async with _user_lock(ctx, uid):
+        user = await store(ctx).aload(uid)
+        if not user:
+            return ConversationHandler.END
+        user.journal.append({"date": _user_now(user).isoformat(), "text": text})
+        await store(ctx).asave(user)
+    await update.message.reply_text("Gespeichert. Starker Move — Bewusstsein schlägt Autopilot. 📝")
+    return ConversationHandler.END
+
+# ══════════════════════════════════════════════════════════════════════════
+# CRISIS TOOLKIT  (/sos, /craving)
+# ══════════════════════════════════════════════════════════════════════════
+
+C_MENU, C_G1, C_G2, C_G3, C_G4, C_G5, C_SURF1, C_SURF_R1, C_SURF_R2, C_CONTACT = range(10)
+
+def _sos_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧘 Grounding (5-4-3-2-1)", callback_data="sos:ground")],
+        [InlineKeyboardButton("🫁 Atemübung", callback_data="sos:breathe")],
+        [InlineKeyboardButton("🌊 Urge Surfing", callback_data="sos:surf")],
+        [InlineKeyboardButton("📞 Jemanden anrufen", callback_data="sos:call")],
+        [InlineKeyboardButton("🎯 Ablenkung", callback_data="sos:distract")],
+    ])
+
+def _fb_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Ja 💚", callback_data="sos:yes"),
+        InlineKeyboardButton("Nein", callback_data="sos:no"),
+    ]])
+
+def _rating_kb(prefix: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(str(n), callback_data=f"sos:{prefix}_{n}") for n in range(1, 6)],
+        [InlineKeyboardButton(str(n), callback_data=f"sos:{prefix}_{n}") for n in range(6, 11)],
+    ])
+
+def _cancel_sos_tasks(ud: dict) -> None:
+    """Cancel any running breathing/surf background tasks."""
+    for key in ("breathing_task", "surf_task"):
+        task = ud.get(key)
+        if task and not task.done():
+            task.cancel()
+
+
+def _log_task_exc(task: asyncio.Task) -> None:
+    """done_callback for background SOS tasks — surface silent exceptions."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.error("SOS background task failed: %s", exc, exc_info=exc)
+
+
+async def _absorb_sos_text(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Swallow stray text messages inside SOS states so they don't leak to
+    the free-text AI handler. Returns None → stay in current state."""
+    if isinstance(update.effective_message, Message):
+        await update.effective_message.reply_text(
+            "Nutze bitte die Buttons oder /cancel — wir sind noch im SOS-Flow."
+        )
+    return None
+
+async def cmd_sos(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message:
+        return ConversationHandler.END
+    # Cancel any running SOS tasks from a previous /sos invocation
+    _cancel_sos_tasks(ctx.user_data)
+    await update.message.reply_text("Ich bin da. Cravings gehen vorbei — lass uns das zusammen durchstehen.")
+    await update.message.reply_text("Wähle ein Werkzeug:", reply_markup=_sos_kb())
+    return C_MENU
+
+async def sos_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    if not q or not q.data or not isinstance(q.message, Message):
+        return ConversationHandler.END
+    await q.answer()
+    action = q.data.split(":")[1]
+    msg = q.message
+
+    # Cancel any running SOS tasks on menu interaction
+    ud = ctx.user_data
+    _cancel_sos_tasks(ud)
+
+    if action == "ground":
+        await msg.reply_text("🧘 Grounding (5-4-3-2-1)\n\nNenne mir 5 Dinge, die du gerade SIEHST:")
+        return C_G1
+    if action == "breathe":
+        task = asyncio.create_task(_run_breathing(msg))
+        task.add_done_callback(_log_task_exc)
+        ud["breathing_task"] = task
+        return C_MENU
+    if action == "surf":
+        await msg.reply_text("🌊 Urge Surfing\n\nSchritt 1: Wo spürst du das Craving im Körper?\n(z.B. Brust, Magen, Hände)")
+        return C_SURF1
+    if action == "call":
+        # Check persisted UserState first, fall back to in-memory
+        contact = None
+        if update.effective_user:
+            user = await store(ctx).aload(update.effective_user.id)
+            if user and user.emergency_contact:
+                contact = user.emergency_contact
+        if not contact:
+            contact = ctx.user_data.get("emergency_contact")
+        if contact:
+            await msg.reply_text(f"Dein Notfallkontakt: {contact}\n\nRuf jetzt an.")
+            await msg.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
+            return C_MENU
+        await msg.reply_text("Schick mir einen Namen oder eine Nummer:")
+        return C_CONTACT
+    if action == "distract":
+        tips = {
+            range(5, 12): "🚶 15 Min spazieren | 🧘 Yoga | 🚿 Kalt duschen",
+            range(12, 17): "💪 Workout | 🍳 Kochen | 🧹 Aufräumen",
+            range(17, 22): "📖 Lesen | 🎧 Podcast | 🤸 Stretching",
+        }
+        u = await store(ctx).aload(update.effective_user.id) if update.effective_user else None
+        h = (_user_now(u) if u else datetime.now(ZoneInfo(TIMEZONE))).hour
+        tip = next((v for r, v in tips.items() if h in r), "🫁 Atemübung | 🍵 Tee | 📝 Journaling")
+        await msg.reply_text(tip)
+        await msg.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
+        return C_MENU
+    if action == "yes":
+        await msg.reply_text("Stark. Du hast das geschafft. 💪")
+        return ConversationHandler.END
+    if action == "no":
+        await msg.reply_text("Probier ein anderes Werkzeug:", reply_markup=_sos_kb())
+        return C_MENU
+    return C_MENU
+
+async def _run_breathing(msg: Message) -> None:
+    m = await msg.reply_text("🫁 Atemübung startet...")
+    await asyncio.sleep(2)
+    for i in range(1, 6):
+        try:
+            await m.edit_text(f"Runde {i}/5\n\n🫁 Einatmen... 4s")
+            await asyncio.sleep(4)
+            await m.edit_text(f"Runde {i}/5\n\n⏸️ Halten... 2s")
+            await asyncio.sleep(2)
+            await m.edit_text(f"Runde {i}/5\n\n💨 Ausatmen... 6s")
+            await asyncio.sleep(6)
+        except TelegramError:
+            break
+    try:
+        await m.edit_text("✅ 5 Runden geschafft. Spür nach, wie sich dein Körper anfühlt.")
+    except TelegramError:
+        pass
+    await msg.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
+
+# Grounding steps
+async def _g_step(update: Update, next_s: int, prompt: str) -> int:
+    if isinstance(update.effective_message, Message):
+        await update.effective_message.reply_text(prompt)
+    return next_s
+
+async def g1(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _g_step(update, C_G2, "👂 Gut. 4 Dinge, die du HÖRST:")
+
+async def g2(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _g_step(update, C_G3, "✋ 3 Dinge, die du FÜHLST/BERÜHRST:")
+
+async def g3(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _g_step(update, C_G4, "👃 2 Dinge, die du RIECHST:")
+
+async def g4(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _g_step(update, C_G5, "👅 1 Ding, das du SCHMECKST:")
+
+async def g5(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if isinstance(update.effective_message, Message):
+        await update.effective_message.reply_text("Gut gemacht. Du bist hier. Du bist sicher. 💚")
+        await update.effective_message.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
+    return C_MENU
+
+# Urge surfing
+async def surf1(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not isinstance(update.effective_message, Message):
+        return ConversationHandler.END
+    loc = (update.effective_message.text or "").strip()[:60]
+    ctx.user_data["surf_loc"] = loc
+    prompt = (
+        f"Bleib mit der Aufmerksamkeit bei {loc}. Wie stark ist das Craving? (1-10)"
+        if loc else "Wie stark ist das Craving? (1-10)"
+    )
+    await update.effective_message.reply_text(prompt, reply_markup=_rating_kb("r1"))
+    return C_SURF_R1
+
+async def _run_surf_timer(msg: Message, r: int) -> None:
+    """Background task for the 2-minute urge surfing timer."""
+    m = await msg.reply_text(f"Intensität: {r}/10\n\n🌊 Beobachte die Welle... ⏳ 2 Min")
+    for sec in [90, 60, 30, 0]:
+        await asyncio.sleep(30)
+        try:
+            await m.edit_text(f"🌊 Beobachte... ⏳ {sec}s" if sec else "🌊 Die 2 Minuten sind um.")
+        except TelegramError:
+            pass
+    await msg.reply_text("Wie stark ist das Craving JETZT?", reply_markup=_rating_kb("r2"))
+
+async def surf_r1(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    if not q or not q.data or not isinstance(q.message, Message):
+        return ConversationHandler.END
+    await q.answer()
+    try:
+        r = int(q.data.split("_")[1])
+    except (IndexError, ValueError):
+        return ConversationHandler.END
+    ud = ctx.user_data
+    ud["surf_r1"] = r
+    task = asyncio.create_task(_run_surf_timer(q.message, r))
+    task.add_done_callback(_log_task_exc)
+    ud["surf_task"] = task
+    return C_SURF_R2
+
+async def surf_r2(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    if not q or not q.data or not isinstance(q.message, Message):
+        return ConversationHandler.END
+    await q.answer()
+    try:
+        r2 = int(q.data.split("_")[1])
+    except (IndexError, ValueError):
+        return ConversationHandler.END
+    r1 = ctx.user_data.get("surf_r1", r2)
+    diff = r1 - r2
+    if diff > 0:
+        txt = f"Vorher: {r1}/10 → Jetzt: {r2}/10\n\n📉 {diff} Punkte weniger. Die Welle geht vorbei."
+    elif diff == 0:
+        txt = "Gleich geblieben — das ist okay. Wellen brauchen manchmal länger."
+    else:
+        txt = "Stärker geworden. Probier noch ein anderes Werkzeug."
+    await q.message.reply_text(txt)
+    await q.message.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
+    return C_MENU
+
+async def on_contact(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not isinstance(update.effective_message, Message):
+        return ConversationHandler.END
+    contact = (update.effective_message.text or "").strip()
+    if not contact:
+        await update.effective_message.reply_text("Bitte schick mir einen Namen oder Nummer:")
+        return C_CONTACT
+    ud = ctx.user_data
+    ud["emergency_contact"] = contact
+    # Persist to UserState for restart resilience
+    if update.effective_user:
+        uid = update.effective_user.id
+        async with _user_lock(ctx, uid):
+            user = await store(ctx).aload(uid)
+            if user:
+                user.emergency_contact = contact
+                await store(ctx).asave(user)
+    await update.effective_message.reply_text(f"✅ Notfallkontakt gespeichert: {contact}")
+    await update.effective_message.reply_text("Hat das geholfen?", reply_markup=_fb_kb())
+    return C_MENU
+
+# ══════════════════════════════════════════════════════════════════════════
+# AI COACHING (free-text messages)
+# ══════════════════════════════════════════════════════════════════════════
+
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user or not update.message.text:
+        return
+    text = update.message.text
+    uid = update.effective_user.id
+
+    # Soft spam guard: if the per-user lock is already held (an earlier AI
+    # call still in flight, or another handler mid-update), bail out with a
+    # nudge instead of queuing another LLM round-trip.
+    lock = _user_lock(ctx, uid)
+    if lock.locked():
+        await update.message.reply_text("Einen Moment — ich antworte gerade auf deine letzte Nachricht.")
+        return
+
+    async with lock:
+        user = await store(ctx).aload(uid)
+        if not user:
+            await update.message.reply_text("Starte zuerst mit /start.")
+            return
+
+        # Intent detection
+        intent = detect_intent(text)
+        if intent:
+            kind, data = intent
+            if kind == "relapse":
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Ja, leider", callback_data="rel:yes")],
+                    [InlineKeyboardButton("Nein, Missverständnis", callback_data="rel:no")],
+                ])
+                await update.message.reply_text("Hast du wirklich konsumiert?", reply_markup=kb)
+                return
+            if kind == "journal":
+                user.journal.append({"date": _user_now(user).isoformat(), "text": data})
+                await store(ctx).asave(user)
+                await update.message.reply_text("Gespeichert. 📝")
+                return
+
+        # AI coaching
+        h = hist(ctx)
+        # Restore history from persistent storage on first access
+        if not h.recent(uid, 1) and user.chat_history:
+            for entry in user.chat_history:
+                h.add(uid, entry.get("role", "user"), entry.get("text", ""))
+        history_text = h.format(uid, 6)
+        h.add(uid, "user", text)
+        reply = await ai(ctx).reply(user, text, history_text=history_text)
+        h.add(uid, "coach", reply)
+
+        # Send (handle Telegram message length limit, split at newline boundaries)
+        if len(reply) <= _TG_MSG_LIMIT:
+            await update.message.reply_text(reply)
+        else:
+            while reply:
+                if len(reply) <= _TG_SPLIT_AT:
+                    await update.message.reply_text(reply)
+                    break
+                split_at = reply.rfind("\n", 0, _TG_SPLIT_AT)
+                if split_at == -1:
+                    split_at = _TG_SPLIT_AT
+                await update.message.reply_text(reply[:split_at])
+                reply = reply[split_at:].lstrip("\n")
+
+        # Persist recent history to user data for restart resilience
+        user.chat_history = [{"role": t.role, "text": t.text} for t in h.recent(uid, 20)]
+        await store(ctx).asave(user)
+
+async def on_relapse_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q or not q.data or not update.effective_user:
+        return
+    await q.answer()
+    uid = update.effective_user.id
+    async with _user_lock(ctx, uid):
+        user = await store(ctx).aload(uid)
+        if not user or not q.message:
+            return
+        if q.data == "rel:yes":
+            user.reset_streak()
+            await store(ctx).asave(user)
+            await q.message.reply_text("Danke für deine Ehrlichkeit. Tag 1. /undo innerhalb 5 Min wenn Fehler.")
+        else:
+            await q.message.reply_text("Danke fürs Klarstellen. Dein Streak bleibt. Du machst das gut.")
+
+# ══════════════════════════════════════════════════════════════════════════
+# PROACTIVE MESSAGES (morning, nudge, evening)
+# ══════════════════════════════════════════════════════════════════════════
+
+async def _proactive(app: Application, uid: int, prompt: str) -> None:
+    s: Store = app.bot_data["store"]
+    user = await s.aload(uid)
+    if not user:
+        return
+    client: AIClient = app.bot_data["ai"]
+    if not client.configured():
+        return
+    try:
+        reply = await client.reply(user, prompt)
+        await app.bot.send_message(chat_id=uid, text=reply)
+    except TelegramError as exc:
+        log.error("Proactive msg failed for %d: %s", uid, exc)
+    except Exception as exc:  # Last-resort guard so a single job can't kill JobQueue
+        log.error("Proactive msg unexpected failure for %d: %s", uid, exc, exc_info=exc)
+
+async def send_morning(app: Application, uid: int) -> None:
+    s: Store = app.bot_data["store"]
+    user = await s.aload(uid)
+    if not user:
+        return
+    user.calc_streak()
+    await _proactive(app, uid, (
+        f"Schreibe eine persönliche Morgengrußnachricht. "
+        f"Tag {user.streak_days} clean, {user.savings():.2f}€ gespart. "
+        f"Gewohnheit: {user.habit}. 2-3 Sätze auf Deutsch. Warm und konkret."
+    ))
+
+async def send_nudge(app: Application, uid: int) -> None:
+    s: Store = app.bot_data["store"]
+    user = await s.aload(uid)
+    if not user:
+        return
+    user.calc_streak()
+    await _proactive(app, uid, (
+        f"Schreibe einen kurzen Mittags-Nudge. Tag {user.streak_days} clean. "
+        f"GENAU ein Satz auf Deutsch. Persönlich, kein Klischee."
+    ))
+
+async def send_evening(app: Application, uid: int) -> None:
+    s: Store = app.bot_data["store"]
+    user = await s.aload(uid)
+    if not user:
+        return
+    user.calc_streak()
+    await _proactive(app, uid, (
+        f"Schreibe eine Abendreflexion. Tag {user.streak_days} clean, {user.savings():.2f}€ gespart. "
+        f"Gewohnheit: {user.habit}. Tagesrückblick, Anerkennung. 2-3 Sätze Deutsch."
+    ))
+
+def _schedule_user_jobs(app: Application, uid: int, timezone: str, wake_time: str) -> None:
+    try:
+        tz = ZoneInfo(timezone or TIMEZONE)
+    except (ZoneInfoNotFoundError, ValueError, TypeError):
+        log.warning("Invalid timezone '%s' for user %d, falling back to %s", timezone, uid, TIMEZONE)
+        tz = ZoneInfo(TIMEZONE)
+    wake = _parse_time(wake_time)
+    jq = cast(JobQueue, app.job_queue)
+
+    # Remove old jobs for this user
+    for name in [f"m_{uid}", f"n_{uid}", f"e_{uid}"]:
+        for job in jq.get_jobs_by_name(name):
+            job.schedule_removal()
+
+    async def _job_morning(_ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        await send_morning(app, uid)
+
+    async def _job_nudge(_ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        await send_nudge(app, uid)
+
+    async def _job_evening(_ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        await send_evening(app, uid)
+
+    jq.run_daily(_job_morning, time=time(wake.hour, wake.minute, tzinfo=tz), name=f"m_{uid}")
+    # Nudge = 6h after wake, capped at 20:00 for normal cases. For late risers
+    # (wake hour > 14) the cap can land before wake — fall back to wake + 1h,
+    # bounded by 23:59 so we never cross midnight.
+    nudge_h = min(wake.hour + 6, 20)
+    nudge_m = wake.minute if nudge_h == wake.hour + 6 else 0
+    nudge_total = nudge_h * 60 + nudge_m
+    wake_total = wake.hour * 60 + wake.minute
+    if nudge_total <= wake_total:
+        nudge_total = min(wake_total + 60, 23 * 60 + 59)
+        nudge_h, nudge_m = divmod(nudge_total, 60)
+    jq.run_daily(_job_nudge, time=time(nudge_h, nudge_m, tzinfo=tz), name=f"n_{uid}")
+    jq.run_daily(_job_evening, time=time(21, 0, tzinfo=tz), name=f"e_{uid}")
+
+# ══════════════════════════════════════════════════════════════════════════
+# HELP
+# ══════════════════════════════════════════════════════════════════════════
+
+HELP_TEXT = (
+    "Ich bin dein Unhooked Coach. Schreib mir jederzeit.\n\n"
+    "/status — Streak, Erspartes\n"
+    "/savings — Geld gespart / Ziel setzen\n"
+    "/undo — Reset rückgängig (5 Min)\n"
+    "/check 7 3 2 — Stimmung/Craving/Stress\n"
+    "/sos — Crisis Toolkit\n"
+    "/journal — Tagebuch\n"
+    "/settings — (coming soon)\n"
+    "/help — Diese Hilfe\n\n"
+    "Oder schreib einfach frei — ich bin dein Coach."
+)
+
+async def cmd_help(update: Update, _) -> None:
+    if update.message:
+        await update.message.reply_text(HELP_TEXT)
+
+# ══════════════════════════════════════════════════════════════════════════
+# APP SETUP
+# ══════════════════════════════════════════════════════════════════════════
+
+async def post_init(app: Application) -> None:
+    await app.bot.set_my_commands([
+        BotCommand("sos", "Soforthilfe bei Craving"),
+        BotCommand("status", "Streak & Erspartes"),
+        BotCommand("savings", "Geld gespart"),
+        BotCommand("check", "Quick Check-in"),
+        BotCommand("undo", "Reset rückgängig"),
+        BotCommand("journal", "Tagebuch"),
+        BotCommand("help", "Alle Befehle"),
+    ])
+    s: Store = app.bot_data["store"]
+    # Only load the 3 scheduling fields per user — avoids materializing full
+    # UserState (journal, chat_history, ...) just to register cron jobs.
+    for uid, tz_name, wake in await s.aall_schedules():
+        _schedule_user_jobs(app, uid, tz_name, wake)
+
+def main() -> None:
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is required")
+
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.bot_data["store"] = Store(DATA_DIR)
+    app.bot_data["ai"] = AIClient(
+        provider=AI_PROVIDER, model=AI_MODEL,
+        openai_key=OPENAI_KEY, anthropic_key=ANTHROPIC_KEY,
+    )
+    app.bot_data["history"] = History()
+
+    # Security guard
+    app.add_handler(TypeHandler(Update, _guard), group=-1)
+
+    # Onboarding conversation
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("start", cmd_start)],
+        states={
+            S_HABIT: [CallbackQueryHandler(on_habit, pattern=r"^h:")],
+            S_HABIT_TXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_habit_text)],
+            S_LAST: [CallbackQueryHandler(on_last_use, pattern=r"^l:")],
+            S_WAKE: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_wake)],
+            S_SAVINGS: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_savings)],
+            S_TRIG: [CallbackQueryHandler(on_trigger, pattern=r"^t:")],
+            S_WHY: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_why)],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+    ))
+
+    # Journal conversation
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("journal", cmd_journal)],
+        states={J_WRITE: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_journal_text)]},
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+    ))
+
+    # Crisis toolkit conversation
+    txt_filter = filters.TEXT & ~filters.COMMAND
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("sos", cmd_sos), CommandHandler("craving", cmd_sos)],
+        states={
+            # Absorber after each callback handler so stray text while
+            # waiting on buttons doesn't fall through to the AI coach.
+            C_MENU: [
+                CallbackQueryHandler(sos_menu, pattern=r"^sos:"),
+                MessageHandler(txt_filter, _absorb_sos_text),
+            ],
+            C_G1: [MessageHandler(txt_filter, g1)],
+            C_G2: [MessageHandler(txt_filter, g2)],
+            C_G3: [MessageHandler(txt_filter, g3)],
+            C_G4: [MessageHandler(txt_filter, g4)],
+            C_G5: [MessageHandler(txt_filter, g5)],
+            C_SURF1: [MessageHandler(txt_filter, surf1)],
+            C_SURF_R1: [
+                CallbackQueryHandler(surf_r1, pattern=r"^sos:r1_"),
+                MessageHandler(txt_filter, _absorb_sos_text),
+            ],
+            C_SURF_R2: [
+                CallbackQueryHandler(surf_r2, pattern=r"^sos:r2_"),
+                MessageHandler(txt_filter, _absorb_sos_text),
+            ],
+            C_CONTACT: [MessageHandler(txt_filter, on_contact)],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel), CommandHandler("sos", cmd_sos)],
+        allow_reentry=True,
+    ))
+
+    # Simple commands
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("streak", cmd_status))
+    app.add_handler(CommandHandler("why", cmd_why))
+    app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("undo", cmd_undo))
+    app.add_handler(CommandHandler("savings", cmd_savings))
+    app.add_handler(CommandHandler("check", cmd_check))
+    app.add_handler(CommandHandler("help", cmd_help))
+
+    # Relapse confirmation callback
+    app.add_handler(CallbackQueryHandler(on_relapse_cb, pattern=r"^rel:"))
+
+    # Free-text AI coaching (catch-all — must be last)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
+    app.post_init = post_init
+    log.info("Starting Unhooked Lite")
+    app.run_polling(close_loop=False)
+
+if __name__ == "__main__":
+    main()
+ 

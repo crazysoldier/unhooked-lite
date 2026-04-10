@@ -1,0 +1,196 @@
+"""User model + JSON persistence — single module replaces models/, storage/."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import threading
+from dataclasses import asdict, dataclass, field
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class UserState:
+    user_id: int
+    username: str = ""
+    habit: str = ""
+    why: str = ""
+    # Placeholder only — onboarding always overrides this with a date computed
+    # in the user's timezone. Uses the host's local date to stay consistent
+    # with wall-clock time when a UserState is constructed without an explicit
+    # quit_date (e.g. tests).
+    quit_date: str = field(default_factory=lambda: date.today().isoformat())
+    wake_time: str = "07:30"
+    timezone: str = "Europe/Vienna"
+    triggers: list[str] = field(default_factory=list)
+    streak_days: int = 0
+    longest_streak: int = 0
+    relapses: int = 0
+    savings_per_day: float = 1.5
+    savings_goal: float = 0.0
+    mood_log: list[dict] = field(default_factory=list)
+    journal: list[dict] = field(default_factory=list)
+    chat_history: list[dict] = field(default_factory=list)
+    emergency_contact: str = ""
+    last_relapse_reset: dict | None = None
+    created_at: str = field(default_factory=lambda: datetime.now(ZoneInfo("UTC")).isoformat())
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> UserState:
+        # Drop unknown keys so old data files don't crash
+        valid = {f.name for f in cls.__dataclass_fields__.values()}
+        return cls(**{k: v for k, v in data.items() if k in valid})
+
+    def _today(self) -> date:
+        """Return today's date in the user's configured timezone."""
+        try:
+            return datetime.now(ZoneInfo(self.timezone)).date()
+        except (ZoneInfoNotFoundError, ValueError, TypeError):
+            logger.warning(
+                "Invalid timezone '%s' for user %d, falling back to UTC",
+                self.timezone, self.user_id,
+            )
+            return datetime.now(ZoneInfo("UTC")).date()
+
+    def calc_streak(self, today: date | None = None) -> int:
+        base = today or self._today()
+        try:
+            quit = date.fromisoformat(self.quit_date)
+        except ValueError:
+            logger.warning("Invalid quit_date '%s' for user %d, resetting to today", self.quit_date, self.user_id)
+            self.quit_date = base.isoformat()
+            quit = base
+        delta = (base - quit).days + 1
+        self.streak_days = max(0, delta)
+        self.longest_streak = max(self.longest_streak, self.streak_days)
+        return self.streak_days
+
+    def reset_streak(self, reset_date: date | None = None) -> None:
+        self.last_relapse_reset = {
+            "quit_date": self.quit_date,
+            "streak_days": self.streak_days,
+            "longest_streak": self.longest_streak,
+            "relapses": self.relapses,
+            "reset_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+        }
+        self.relapses += 1
+        self.quit_date = (reset_date or self._today()).isoformat()
+        self.streak_days = 1
+
+    def undo_reset(self, window_s: int = 300) -> bool:
+        if not self.last_relapse_reset:
+            return False
+        try:
+            reset_at = datetime.fromisoformat(str(self.last_relapse_reset["reset_at"]))
+        except (KeyError, ValueError):
+            return False
+        if datetime.now(ZoneInfo("UTC")) - reset_at > timedelta(seconds=window_s):
+            return False
+        self.quit_date = str(self.last_relapse_reset["quit_date"])
+        self.streak_days = int(self.last_relapse_reset["streak_days"])
+        self.longest_streak = int(self.last_relapse_reset["longest_streak"])
+        self.relapses = int(self.last_relapse_reset["relapses"])
+        self.last_relapse_reset = None
+        return True
+
+    def savings(self) -> float:
+        return round(self.savings_per_day * max(self.streak_days, 0), 2)
+
+
+class Store:
+    """Simple JSON file store — one file per user."""
+
+    def __init__(self, data_dir: str = "./data") -> None:
+        self.base = Path(data_dir)
+        self.base.mkdir(parents=True, exist_ok=True)
+
+    def _path(self, uid: int) -> Path:
+        return self.base / f"{uid}.json"
+
+    def load(self, uid: int) -> UserState | None:
+        p = self._path(uid)
+        if not p.exists():
+            return None
+        try:
+            return UserState.from_dict(json.loads(p.read_text(encoding="utf-8")))
+        except (json.JSONDecodeError, TypeError, AttributeError) as exc:
+            logger.error("Corrupted data file %s: %s", p, exc)
+            return None
+
+    def save(self, user: UserState) -> None:
+        path = self._path(user.user_id)
+        # Unique tmp name so two concurrent saves (e.g. JobQueue + user handler)
+        # don't clobber each other's in-progress writes before the atomic rename.
+        # Use with_name (not with_suffix) so Python 3.12.2+ doesn't reject the
+        # embedded dots.
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            tmp.write_text(json.dumps(user.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        except Exception:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
+
+    def all_users(self) -> list[UserState]:
+        users: list[UserState] = []
+        for f in self.base.glob("*.json"):
+            # Skip half-written tmp files ("123.json.<pid>.<tid>.tmp")
+            if f.name.endswith(".tmp"):
+                continue
+            try:
+                users.append(UserState.from_dict(json.loads(f.read_text(encoding="utf-8"))))
+            except (json.JSONDecodeError, TypeError, AttributeError) as exc:
+                logger.error("Skipping corrupted data file %s: %s", f, exc)
+        return users
+
+    def all_schedules(self) -> list[tuple[int, str, str]]:
+        """Return only the fields needed for job scheduling — (uid, tz, wake).
+
+        Used by bot startup to register JobQueue entries without materializing
+        every UserState (journal, chat_history, mood_log, ...). Keeps startup
+        cheap as the user base grows.
+        """
+        out: list[tuple[int, str, str]] = []
+        for f in self.base.glob("*.json"):
+            if f.name.endswith(".tmp"):
+                continue
+            try:
+                d = json.loads(f.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.error("Skipping corrupted data file %s: %s", f, exc)
+                continue
+            uid = d.get("user_id")
+            if not isinstance(uid, int):
+                continue
+            tz = d.get("timezone") or "Europe/Vienna"
+            wake = d.get("wake_time") or "07:30"
+            out.append((uid, str(tz), str(wake)))
+        return out
+
+    # --- Async wrappers ------------------------------------------------------
+    # The bot runs on an asyncio event loop; file I/O is blocking. Dispatch
+    # to a worker thread so we don't stall the loop under concurrent traffic.
+
+    async def aload(self, uid: int) -> UserState | None:
+        return await asyncio.to_thread(self.load, uid)
+
+    async def asave(self, user: UserState) -> None:
+        await asyncio.to_thread(self.save, user)
+
+    async def aall_users(self) -> list[UserState]:
+        return await asyncio.to_thread(self.all_users)
+
+    async def aall_schedules(self) -> list[tuple[int, str, str]]:
+        return await asyncio.to_thread(self.all_schedules)
